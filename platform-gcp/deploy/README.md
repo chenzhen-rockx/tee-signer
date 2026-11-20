@@ -371,6 +371,13 @@ any (`slashing-log/docs/durable-state.md`, "The network entry's node
 state"). `firewall-delete` removes the TCP 7100 rule when another entry
 replaces it.
 
+The overlay's `gcp_vm_create` hook (`devnet_gcp_vm_create`) may create the
+VM itself. `vm-create` calls it before the `CONFIRM` gate, with the
+`gcloud compute instances create` arguments. `vm-create` reads the account's
+email before the gate only with `CONFIRM=yes`, so the hook gets the real
+email in `--service-account` with `CONFIRM=yes` and the placeholder
+`<email of signer-workload>` without it.
+
 ### Outbound internet
 
 The signer needs outbound internet: the network entry (its coordination
@@ -424,7 +431,14 @@ machine type, quota, and the newest Confidential Space image.
    temporary Docker config, so `~/.docker` stays as it is.
 7. `kms-create`: key ring `signer`, HSM key `sealing` (purpose `encryption`).
    Key rings and keys cannot be deleted. Only key versions can be destroyed.
-8. `sa-create`: `signer-workload`.
+8. `sa-create`: `signer-workload`. The steps after it read the account's
+   email from `gcloud iam service-accounts list` and stop unless exactly
+   one listed email matches. For a plain project ID only
+   `signer-workload@<gcp-project>.iam.gserviceaccount.com` matches, so the
+   App Engine default account `<gcp-project>@appspot.gserviceaccount.com`
+   never does. Google documents no email form for a domain-scoped project:
+   there the email must start with `signer-workload@` and end in
+   `.iam.gserviceaccount.com`. The match compares bytes (`LC_ALL=C`).
 9. `sa-bindings`: the service account gets `artifactregistry.reader` on the
    repository only, and at project level
    `confidentialcomputing.workloadUser` (attestation tokens) and
@@ -460,6 +474,22 @@ Role bindings take a few minutes to apply. A VM created right after
 `sa-bindings` can fail its first boot with `PermissionDenied` for
 `logging.logEntries.create` and `confidentialcomputing.locations.list`.
 Wait for IAM before `vm-create`, or reset the VM.
+
+`sa-bindings`, `wif-create`, `provider-update`, `vm-create`, `teardown` and
+`verifier-config` read the account's email with
+`gcloud iam service-accounts list`, and `preflight` reads the same list to
+check that the name is free. The gcloud account that runs them needs
+`iam.serviceAccounts.list` on the project, which the predefined role
+`roles/iam.serviceAccountViewer` grants. Google documents that a new
+service account can take 60 seconds or more to become visible, because
+reads are eventually consistent. A step run right after `sa-create` can
+then stop with "found no service account ... run sa-create first". The
+script does not retry: wait and run the step again. `teardown` reads the
+list once, before its first delete, and stops there if the list call fails
+or two accounts match. If no account matches, it deletes the rest, says
+that it found no account and exits 0. Right after `sa-create` the account
+may then still exist: wait, list the accounts and delete it by hand, since
+a second `teardown` stops at the VM that is gone.
 
 After a rebuild: `build-image.sh`, `image-push`, `provider-update`,
 `vm-delete`, `vm-create`. The VM's state goes with it. Without a state copy
@@ -592,7 +622,11 @@ verifier-config` writes them to `$GCP_TEST_DIR/gcp-signer.json` (directory
 700, file 600, no secrets; some chains add a suffix to the file name). With `HARDWARE=amd-sev` it writes a `NOTE.txt` next to it
 that says the file is for AMD SEV only. It needs `GCP_TEST_DIR`, a private
 directory outside the repo, and `CLIENT_CERT` and `CLIENT_KEY`, the signing
-client's client certificate and key; it stops if one is missing.
+client's client certificate and key; it stops if one is missing. It reads
+the service account email with `gcloud iam service-accounts list`, also
+with `SIGNER_ADDRESS` set, where earlier versions made no gcloud call. So it
+needs gcloud access with `iam.serviceAccounts.list` on the project, and the
+account must exist: run it after `sa-create`.
 
 | Setting | Value |
 | --- | --- |
@@ -600,7 +634,7 @@ client's client certificate and key; it stops if one is missing.
 | `gcp_image_digest` | the digest in `build/gcp/runner.digest` |
 | `gcp_audience` | `signer-runner-identity` |
 | `gcp_hwmodels` | `["GCP_AMD_SEV"]` with `HARDWARE=amd-sev`. Production: `["GCP_INTEL_TDX"]` only |
-| `gcp_service_account` | `signer-workload@<gcp-project>.iam.gserviceaccount.com` |
+| `gcp_service_account` | the email of `signer-workload` as gcloud lists it: `signer-workload@<gcp-project>.iam.gserviceaccount.com` for a plain project ID |
 | `gcp_project_id` | `<gcp-project>`, the `PROJECT_ID` of the deploy. With `mainnet` set the client needs it and `gcp_service_account` |
 | `gcp_issuer` | not set: the default `https://confidentialcomputing.googleapis.com` |
 | `address` | `tcp:<signer-node-1-ip>:7100`. The address exists after `address-reserve`. Until then the file holds `tcp:SIGNER_IP:7100` (or set `SIGNER_ADDRESS`) |

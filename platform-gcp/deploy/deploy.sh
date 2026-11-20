@@ -11,8 +11,9 @@
 #                     free names, quota, the newest Confidential Space image
 #   verifier-config   write the gcp-cs settings for the signing client,
 #                     signer-admin import and share-import to a local file
-#                     (no secrets). Without
-#                     SIGNER_ADDRESS it reads the reserved address, read-only
+#                     (no secrets). It reads the service account's email
+#                     and, without SIGNER_ADDRESS, the reserved address,
+#                     read-only
 #   logs              read-only: the VM's serial console and Cloud Logging
 #
 # Steps that create or change something in GCP. Each one prints what it does
@@ -95,6 +96,8 @@ set -euo pipefail
 
 DRY=0
 TMP_DIR=""
+# Set by service_account, never taken from the environment.
+SERVICE_ACCOUNT=""
 trap '[ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"' EXIT
 
 # ---- output helpers ---------------------------------------------------------
@@ -155,6 +158,51 @@ operator_ip() {
     0.0.0.0 | 127.* | 10.* | 192.168.* | 172.1[6-9].* | 172.2?.* | 172.3[01].*) die "OPERATOR_IP $ip is not a public address" ;;
   esac
   echo "$ip"
+}
+
+# The workload account's email as gcloud lists it. Prints each listed email
+# that matches, compared byte by byte (LC_ALL=C). For a plain PROJECT_ID
+# only SA_NAME@PROJECT_ID.iam.gserviceaccount.com, the form Google
+# documents, matches, so the App Engine default account
+# (PROJECT_ID@appspot.gserviceaccount.com) never does, also in a project
+# named SA_NAME. Google documents no form for a domain-scoped project: there
+# the email must start with SA_NAME@ and end in .iam.gserviceaccount.com.
+service_account_emails() {
+  local all
+  all="$(gcloud iam service-accounts list --project="$PROJECT_ID" --format='value(email)')" ||
+    die "cannot list the service accounts of $PROJECT_ID"
+  case "$PROJECT_ID" in
+    *:*)
+      LC_ALL=C awk -v p="$SA_NAME@" -v s=.iam.gserviceaccount.com \
+        'length($0) > length(p s) && index($0, p) == 1 && substr($0, length($0) - length(s) + 1) == s' <<<"$all" ;;
+    *) LC_ALL=C awk -v e="$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com" '$0 == e' <<<"$all" ;;
+  esac
+}
+
+# service_account: set SERVICE_ACCOUNT to that email. It stops unless
+# exactly one account matches. The plan runs no gcloud and shows a
+# placeholder.
+service_account() {
+  local emails
+  if [ "$DRY" = 1 ]; then
+    SERVICE_ACCOUNT="<email of $SA_NAME>"
+    return 0
+  fi
+  emails="$(service_account_emails)"
+  [ -n "$emails" ] || die "found no service account $SA_NAME in $PROJECT_ID: run sa-create first"
+  pick_service_account "$emails"
+}
+
+# pick_service_account EMAILS: set SERVICE_ACCOUNT to the one email in
+# EMAILS, the output of service_account_emails. It stops on two or more.
+pick_service_account() {
+  local n
+  n="$(grep -c . <<<"$1" || true)"
+  [ "$n" = 1 ] || die "found $n service accounts named $SA_NAME in $PROJECT_ID: $(tr '\n' ' ' <<<"$1")"
+  # It goes into the WIF condition between single quotes.
+  LC_ALL=C grep -q -x -E '[a-z0-9-]+@[a-z0-9.-]+' <<<"$1" || die "gcloud lists service account '$1', which is not an email address"
+  SERVICE_ACCOUNT="$1"
+  show "service account $SERVICE_ACCOUNT (from gcloud)"
 }
 
 # The WIF attribute condition. All of it must hold, or the STS exchange fails:
@@ -313,7 +361,7 @@ cmd_kms_key_create() {
 }
 
 cmd_sa_create() {
-  gate sa-create "service account $SERVICE_ACCOUNT: the VM runs as it (attestation tokens, logs, image pull). It gets no key use and no bucket access"
+  gate sa-create "service account $SA_NAME: the VM runs as it (attestation tokens, logs, image pull). It gets no key use and no bucket access. Later steps read its email from gcloud"
   run gcloud iam service-accounts create "$SA_NAME" --display-name="Signer PoC workload" --project="$PROJECT_ID"
 }
 
@@ -323,8 +371,10 @@ cmd_sa_create() {
 # only (wif-create), which needs an attestation token that passes the
 # provider's condition.
 cmd_sa_bindings() {
-  local member="serviceAccount:$SERVICE_ACCOUNT"
-  gate sa-bindings "roles of $SERVICE_ACCOUNT. Registry: read of $AR_REPO only. Project: attestation tokens and log writing. No KMS role"
+  local member
+  gate sa-bindings "roles of service account $SA_NAME. Registry: read of $AR_REPO only. Project: attestation tokens and log writing. No KMS role"
+  service_account
+  member="serviceAccount:$SERVICE_ACCOUNT"
   run gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" --location="$REGION" \
     --member="$member" --role=roles/artifactregistry.reader --project="$PROJECT_ID"
   run gcloud projects add-iam-policy-binding "$PROJECT_ID" \
@@ -337,8 +387,9 @@ cmd_wif_create() {
   local cond
   # Once on its own: inside $(...) a failed check would not stop the step.
   image_digest >/dev/null
-  cond="$(attribute_condition)"
   gate wif-create "workload identity pool $WIF_POOL and OIDC provider $WIF_PROVIDER. It takes tokens from $CS_ISSUER with audience $STS_AUDIENCE only, and only for $(digests_text) on hardware $GCP_HWMODELS (production image, not debug, STABLE). The pool's principal set, and nothing else, may encrypt and decrypt with $KMS_KEY. Keep the pool to this one provider: any provider added to it gets the key"
+  service_account
+  cond="$(attribute_condition)"
   run gcloud iam workload-identity-pools create "$WIF_POOL" --location=global \
     --display-name="Signer PoC" --project="$PROJECT_ID"
   run gcloud iam workload-identity-pools providers create-oidc "$WIF_PROVIDER" --location=global \
@@ -366,7 +417,7 @@ cmd_bucket_bind() {
   else
     [[ "$bucket" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]] || die "bucket-bind needs a bucket name"
   fi
-  gate bucket-bind "on gs://$bucket only: roles/storage.objectCreator, roles/storage.objectViewer and roles/storage.legacyBucketReader (the lock check's bucket read) for the WIF principal set, not for $SERVICE_ACCOUNT"
+  gate bucket-bind "on gs://$bucket only: roles/storage.objectCreator, roles/storage.objectViewer and roles/storage.legacyBucketReader (the lock check's bucket read) for the WIF principal set, not for service account $SA_NAME"
   run gcloud storage buckets add-iam-policy-binding "gs://$bucket" --project="$PROJECT_ID" \
     --member="$WIF_PRINCIPAL_SET" --role=roles/storage.objectCreator
   run gcloud storage buckets add-iam-policy-binding "gs://$bucket" --project="$PROJECT_ID" \
@@ -379,8 +430,9 @@ cmd_provider_update() {
   local cond
   # Once on its own: inside $(...) a failed check would not stop the step.
   image_digest >/dev/null
-  cond="$(attribute_condition)"
   gate provider-update "after a rebuild: provider $WIF_PROVIDER takes $(digests_text) on hardware $GCP_HWMODELS"
+  service_account
+  cond="$(attribute_condition)"
   run gcloud iam workload-identity-pools providers update-oidc "$WIF_PROVIDER" --location=global \
     --workload-identity-pool="$WIF_POOL" --attribute-condition="$cond" --project="$PROJECT_ID"
 }
@@ -402,6 +454,8 @@ cmd_vm_create() {
     base64 -w0 <"$SETUP_FILE" >"$TMP_DIR/setup.b64"
     mff="signer-setup=$TMP_DIR/setup.b64"
   fi
+  # No gcloud call before the gate: without CONFIRM=yes it refuses anyway.
+  if [ "${CONFIRM:-}" = yes ]; then service_account; else SERVICE_ACCOUNT="<email of $SA_NAME>"; fi
   local args=(gcloud compute instances create "$VM" --project="$PROJECT_ID" --zone="$ZONE"
     --machine-type="$MACHINE" --confidential-compute-type="$CC_TYPE")
   [ -z "$MIN_CPU_PLATFORM" ] || args+=(--min-cpu-platform="$MIN_CPU_PLATFORM")
@@ -437,7 +491,7 @@ cmd_vm_delete() {
 cmd_teardown() {
   # A second signer shares the network, rules, registry and service account
   # with the running one: list its own deletes, never the shared ones.
-  local r
+  local r emails
   if side_by_side; then
     show "teardown of a second signer: its own resources only (the network, firewall rules, registry, key ring and service account are shared)"
     show "  \$ $(quote gcloud compute instances delete "$VM" --zone="$ZONE" --project="$PROJECT_ID" --quiet)"
@@ -457,6 +511,16 @@ cmd_teardown() {
     die "teardown refuses with VM, ADDRESS_NAME, KMS_KEY, WIF_POOL or WIF_PROVIDER set: run the deletes above yourself"
   fi
   gate teardown "delete the VM, firewall rules, address, subnet, VPC, registry, WIF provider and pool, and the service account. The KMS key ring and key stay: GCP cannot delete them"
+  # Read the account list once, before the first delete: a failed list
+  # call or two matches stop teardown before it changes anything. A plain
+  # assignment, so a failed list call stops teardown under set -e.
+  SERVICE_ACCOUNT=""
+  if [ "$DRY" = 1 ]; then
+    SERVICE_ACCOUNT="<email of $SA_NAME>"
+  else
+    emails="$(service_account_emails)"
+    [ -z "$emails" ] || pick_service_account "$emails"
+  fi
   run gcloud compute instances delete "$VM" --zone="$ZONE" --project="$PROJECT_ID" --quiet
   run gcloud compute firewall-rules delete "$FW_RULE" --project="$PROJECT_ID" --quiet
   # The egress rules, if egress-create made them.
@@ -474,6 +538,14 @@ cmd_teardown() {
   run gcloud iam workload-identity-pools providers delete "$WIF_PROVIDER" --location=global \
     --workload-identity-pool="$WIF_POOL" --project="$PROJECT_ID" --quiet
   run gcloud iam workload-identity-pools delete "$WIF_POOL" --location=global --project="$PROJECT_ID" --quiet
+  # No account listed: it is gone already, or too new to be listed yet.
+  # A second teardown stops at the first resource that is gone, so the
+  # message says how to delete the account by hand.
+  if [ -z "$SERVICE_ACCOUNT" ]; then
+    show "found no service account $SA_NAME in $PROJECT_ID, so teardown deleted none."
+    show "If sa-create ran in the last few minutes, gcloud may not list the account yet. Wait, then check with $(quote gcloud iam service-accounts list --project="$PROJECT_ID") and delete it by hand: a second teardown stops at the VM that is gone."
+    return 0
+  fi
   run gcloud iam service-accounts delete "$SERVICE_ACCOUNT" --project="$PROJECT_ID" --quiet
 }
 
@@ -508,7 +580,7 @@ EOF
 Image     $IMAGE_REPO@$digest
 Network   $(network_line)
 Names     key $KMS_KEY_RESOURCE
-          service account $SERVICE_ACCOUNT
+          service account $SA_NAME (each step reads its email from gcloud)
           WIF provider $WIF_PROVIDER_RESOURCE
           identity audience $IDENTITY_AUDIENCE (the WIF provider accepts $STS_AUDIENCE only)
 
@@ -537,9 +609,9 @@ EOF
     steps="$own $addr image-push kms-key-create wif-create bucket-bind vm-create"
     echo "A second signer next to a running one: VM $VM, ${addr:+address $ADDRESS_NAME, }key $KMS_KEY, pool $WIF_POOL, provider $WIF_PROVIDER${mine:+, $mine}."
     if [ -n "$mine" ]; then
-      echo "The network $VPC, the registry $AR_REPO, the key ring $KMS_RING and $SERVICE_ACCOUNT are shared and exist."
+      echo "The network $VPC, the registry $AR_REPO, the key ring $KMS_RING and the service account $SA_NAME are shared and exist."
     else
-      echo "The network $VPC, the firewall rules, the registry $AR_REPO, the key ring $KMS_RING and $SERVICE_ACCOUNT are shared and exist."
+      echo "The network $VPC, the firewall rules, the registry $AR_REPO, the key ring $KMS_RING and the service account $SA_NAME are shared and exist."
     fi
     echo
   fi
@@ -593,7 +665,13 @@ cmd_preflight() {
   done
   free "registry $AR_REPO" gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" --project="$PROJECT_ID"
   free "key ring $KMS_RING" gcloud kms keyrings describe "$KMS_RING" --location="$REGION" --project="$PROJECT_ID"
-  free "service account $SA_NAME" gcloud iam service-accounts describe "$SERVICE_ACCOUNT" --project="$PROJECT_ID"
+  if ! d="$(service_account_emails 2>/dev/null)"; then
+    bad "service accounts of $PROJECT_ID not readable"
+  elif [ -n "$d" ]; then
+    bad "service account $SA_NAME exists already ($(tr '\n' ' ' <<<"$d"))"
+  else
+    ok "service account $SA_NAME is free"
+  fi
   free "WIF pool $WIF_POOL" gcloud iam workload-identity-pools describe "$WIF_POOL" --location=global --project="$PROJECT_ID"
   free "VM $VM" gcloud compute instances describe "$VM" --zone="$ZONE" --project="$PROJECT_ID"
   d="$(gcloud compute images describe-from-family "$CS_IMAGE_FAMILY" --project="$CS_IMAGE_PROJECT" \
@@ -630,6 +708,7 @@ cmd_verifier_config() {
       --format='value(address)' 2>/dev/null || true)"
   fi
   addr="tcp:${addr:-SIGNER_IP}:$SIGNER_PORT"
+  service_account
   mkdir -p "$dir"
   chmod 700 "$dir"
   (
