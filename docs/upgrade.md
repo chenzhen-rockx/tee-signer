@@ -153,6 +153,35 @@ details" page names, except DigiCert Global Root CA (G1): no chain the
 runner sees ends there, and the Mozilla list no longer has it. If an Azure
 endpoint the runner calls moves to G1, add it.
 
+## From rc.2: long store outages end a signer
+
+From rc.3 a running runner that writes no mark log record for half of
+`slashing_log_min_lock_days` stops writing until a restart. The restart
+runs the age check, which stops it unless a newer record landed (a
+create the host held back past the bound can still land). The signer
+then needs a new setup and a re-import, as one stopped that long always
+did. Three outages stop the records, though the store itself may work:
+the store out of reach, a read of the store's lock that fails (for
+example a 403 from the management API), and a trusted clock that fails.
+Each counts toward the bound. Set
+`slashing_log_min_lock_days` so that half of it is longer than any such
+outage you plan for, and alert on
+`tee_signer_mark_log_written_timestamp_seconds`
+([tooling/health-exporter/README.md](../tooling/health-exporter/README.md)).
+
+## From rc.2: at least 7 lock days on prod chains
+
+From rc.3 `setup-tool encode` and `signer-admin setup` refuse a setup of
+a prod chain (mainnet, or genesis values no row of the chain table
+matches) with `slashing_log_min_lock_days` below 7. Half of it is the
+longest store, lock read or clock outage a running signer survives (see
+above). Non-prod chains (Hoodi, devnets of the chain table) still take
+1. The setup format stays 6. A prod setup encoded before this rule keeps
+starting: the runner logs a warning at start and HEALTH says
+`lock_days_warning`, and `setup-tool check`, which the deploy scripts
+run, prints a WARNING and passes. Make the next setup of such a signer
+with 7 days or more.
+
 ## Rules
 
 - Keep t of n signers up. Switch one signer at a time, and finish it

@@ -104,6 +104,13 @@ type Health struct {
 	// says it, unattested, as it says key_lock. Runners without a setup
 	// and runners before it leave it out.
 	SingleKey string `json:"single_key,omitempty"`
+	// LockDaysWarning is set when the setup is of a prod chain and its
+	// slashing_log_min_lock_days is below 7, the floor the tools take for
+	// a new setup (setupwire.CheckMinLockDays). The runner serves such a
+	// setup, encoded before that rule, and stays ready; half of the value
+	// is the longest store, lock read or clock outage it survives. Empty
+	// otherwise, without a setup, and from runners before it.
+	LockDaysWarning string `json:"lock_days_warning,omitempty"`
 	// SigningMode is the setup's signing_mode: "threshold" (shares of
 	// t-of-n splits with n >= 2), "single" (whole keys, 1 of 1 import
 	// orders only) or "dv_share" (one share of each Charon distributed
@@ -123,8 +130,12 @@ type Health struct {
 	// store was no longer locked at a refresh (markstore.ErrNoLock), or
 	// "mark log paused: store lock unchecked: ..." while its last lock check
 	// could not read the lock (markstore.ErrLockUnchecked; cleared once a
-	// check passes). Ready is then false. Empty otherwise, and from runners
-	// before it.
+	// check passes within half of slashing_log_min_lock_days of the last
+	// record, else it turns into the stop below), or "mark log stopped: no
+	// record for half the retention: ..." when no record landed for half
+	// of slashing_log_min_lock_days, whatever the cause: the store, the
+	// lock read or the trusted clock (markstore.ErrStale; until a restart).
+	// Ready is then false. Empty otherwise, and from runners before it.
 	MarkLogLost string `json:"mark_log_lost,omitempty"`
 	// RequestPanic says which state-changing request panicked; the
 	// runner then signs and changes nothing until it restarts, and Ready
@@ -157,6 +168,15 @@ type Health struct {
 	// Record describes the mark log (store, signer, owner, newest
 	// record), or "none".
 	Record string `json:"record,omitempty"`
+	// MarkLogWrittenUnix is when the mark log's last record was written,
+	// unix seconds on the trusted clock: the newest record the claim read,
+	// or the newest this runner wrote that landed within the write age
+	// bound. Half of slashing_log_min_lock_days after it the runner writes
+	// no more records (mark_log_lost), so alert long before. Without a
+	// setup (the flag path of the dev platform and debug builds) it is
+	// host-clock time and nothing stops writes. Zero without a mark log,
+	// and from runners before it.
+	MarkLogWrittenUnix uint64 `json:"mark_log_written_unix,omitempty"`
 	// AllowUnverifiedNonslashable is the config switch of that name: the
 	// runner signs bare roots it cannot check (root types 2 to 6).
 	AllowUnverifiedNonslashable bool `json:"allow_unverified_nonslashable"`

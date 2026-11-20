@@ -1629,6 +1629,9 @@ func (s *Server) health() (*backend.Health, error) {
 	if s.Updates != nil {
 		w := s.Updates.SetupWire()
 		h.SingleKey, h.SigningMode = singleKey(&w.Platform), w.SigningMode.String()
+		if err := w.CheckMinLockDays(); err != nil {
+			h.LockDaysWarning = err.Error()
+		}
 		h.LastUpdatePath = s.Updates.lastUpdatePath()
 	}
 	st := s.Signer.Stats()
@@ -1649,8 +1652,13 @@ func (s *Server) health() (*backend.Health, error) {
 		h.Ready, h.MarkLogLost = false, s.Hooks.MarkLogLost().Error()
 	} else if err := s.Hooks.MarkLogStopped(); err != nil {
 		h.Ready, h.MarkLogLost = false, "mark log stopped: store lock lost: "+err.Error()
+	} else if err := s.Hooks.MarkLogStale(); err != nil {
+		h.Ready, h.MarkLogLost = false, "mark log stopped: no record for half the retention: "+err.Error()
 	} else if err := s.Hooks.MarkLogUnchecked(); err != nil {
 		h.Ready, h.MarkLogLost = false, "mark log paused: store lock unchecked: "+err.Error()
+	}
+	if w := s.Hooks.MarkLogWritten(); !w.IsZero() {
+		h.MarkLogWrittenUnix = uint64(w.Unix())
 	}
 	if why := s.panicked.Load(); why != nil {
 		h.Ready, h.RequestPanic = false, *why
