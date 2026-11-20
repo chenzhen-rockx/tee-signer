@@ -548,16 +548,20 @@ take the modes of the context files, and PCR0 and PCR2 would follow the
 builder's umask. With them, an EIF built under umask 022 and one under 077
 have the same PCR0, PCR1 and PCR2.
 
-The first line of `enclave/Dockerfile` pins the Dockerfile frontend by
-version and digest (`# syntax=docker/dockerfile:VERSION@sha256:DIGEST`), as
-in the GCP and Azure Dockerfiles. That frontend writes the image config.
-The host's BuildKit still builds the layers. Without the pin, the build uses
-the frontend built into the host's Docker, and the image config can change
-from one Docker version to the next. The build pulls the pinned frontend
-from Docker Hub unless Docker has it already. `scripts/nitro-eif.sh` stops
-if the Dockerfile it builds lacks the pin. The EIF takes the files, the
-command and the environment of the image, not its history. Adding the pin
-left PCR0, PCR1 and PCR2 the same (hoodi build, Docker 29.9.3).
+A pinned BuildKit and a pinned Dockerfile frontend build the enclave image,
+as for the GCP and Azure images. `scripts/common.sh` names the BuildKit
+image by version and index digest (`BUILDKIT_IMAGE`).
+`scripts/nitro-eif.sh` builds on the buildx builder `BUILDKIT_BUILDER`
+(docker-container driver), which runs that image. The first line of
+`enclave/Dockerfile` pins the frontend
+(`# syntax=docker/dockerfile:VERSION@sha256:DIGEST`). These two build the
+layers and write the image config. The host's Docker only runs the
+BuildKit container. The script loads the image into the host's Docker from
+a docker archive and checks that the loaded image is the one built.
+nitro-cli reads it from there. The first build on a host pulls both images
+from Docker Hub. The script stops if the Dockerfile lacks the frontend pin
+or the builder runs another BuildKit image. The EIF takes the files, the
+command and the environment of the image, not its history.
 
 The KMS key policy takes these PCRs. `scripts/kms-policy.sh` renders it from
 the build, so a new image means a new rendered policy and a new key policy on

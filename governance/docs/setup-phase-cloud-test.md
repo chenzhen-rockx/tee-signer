@@ -105,7 +105,9 @@ builds apart:
 
 Build: `CHAIN=hoodi scripts/generic-images.sh build` (`CHAIN=devnet` also
 needs `CHAIN_JSON`). The runner builds run offline. The first image build on
-a host pulls the pinned Dockerfile frontend from Docker Hub once. The chain goes into every name:
+a host pulls the pinned BuildKit and the pinned Dockerfile frontend from
+Docker Hub once; these two build the images, and the host's Docker only
+runs the BuildKit container. The chain goes into every name:
 runners `runner-<cloud>-hoodi`, folders `build/nitro-hoodi` and
 `build/gcp-hoodi`, local images `signer-cloud/{azure,gcp}-runner-hoodi`,
 registry tags `generic-hoodi-ts` (Azure) and `generic-hoodi` (GCP).

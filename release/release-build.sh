@@ -11,10 +11,12 @@
 #      Debian), the NTS crates (network: crates.io, Cargo.lock),
 #   3. scripts/generic-images.sh build with SIGNER_BUILDER_IMAGE set: the
 #      runners and parent tools in the builder, offline, then the three
-#      images, each built twice. The GCP, Azure and Nitro enclave
-#      Dockerfiles pin their Dockerfile frontend by digest (network: Docker
-#      Hub, docker/dockerfile), so the image config does not follow the
-#      frontend built into the host's Docker,
+#      images, each built twice. A pinned BuildKit (BUILDKIT_IMAGE in
+#      scripts/common.sh, in its own buildx builder) and the pinned
+#      Dockerfile frontend of each Dockerfile build the three images
+#      (network on the first build: Docker Hub, moby/buildkit and
+#      docker/dockerfile). The host's Docker only runs the BuildKit
+#      container, so the images do not follow the host's Docker version,
 #   4. check that the GCP and Azure images are of IMAGE_VARIANT
 #      (release/image-variant.py),
 #   5. copy what a release ships into DIST, with DIST/SHA256SUMS. The names
@@ -40,12 +42,25 @@
 # build_variant dvt (release/measurements.py --build-variant dvt). A lane
 # without DVT is the default variant and says build_variant default.
 #
+# Before the tag. Check that the BuildKit tag still names the pinned
+# digest: docker buildx imagetools inspect moby/buildkit:vX.Y.Z prints the
+# digest of the index, which must equal the one in BUILDKIT_IMAGE
+# (scripts/common.sh). Read the upstream release notes and the open issues
+# of that version (github.com/moby/buildkit). A move to another BuildKit
+# changes the image digests, so it goes in its own commit before the tag.
+#
 # Host prerequisites. The lane checks them before its first long step and
 # names the fix of each one that is missing; it installs nothing.
 #   - An x86_64 build host. The builder image has the amd64 Go and the
 #     aarch64 cross gcc; the arm64 outputs (runner-aws, the EIF, the parent
 #     tools) are cross-built on it.
 #   - Docker with the containerd image store and buildx.
+#   - The pinned BuildKit. The lane starts a privileged BuildKit container
+#     (BUILDKIT_IMAGE in scripts/common.sh, the buildx builder
+#     signer-buildkit) with network access, and checks that it runs before
+#     the first build. The first lane on a host pulls it from Docker Hub.
+#     The container stays after the build; remove it with
+#     docker buildx rm signer-buildkit.
 #   - qemu-user-static (binfmt_misc entry qemu-aarch64 with the F flag) for
 #     the arm64 linuxkit of the EIF build. Docker Desktop has its own.
 #   - az with the confcom extension at the version of AZ_CONFCOM_VERSION.
@@ -151,6 +166,10 @@ if [ ${#missing[@]} -gt 0 ]; then
   printf 'release-build: %s\n' "${missing[@]}" >&2
   die "the host lacks ${#missing[@]} prerequisite(s), see the header of release/release-build.sh"
 fi
+# The pinned BuildKit builds the three images (step 3). Start it now, so a
+# host that cannot pull or run it stops here and not after the long steps.
+pinned_builder ||
+  die "the builder $BUILDKIT_BUILDER does not run the pinned BuildKit $BUILDKIT_IMAGE: Docker must pull it from Docker Hub and run it as a privileged container (docker buildx rm $BUILDKIT_BUILDER removes a broken builder)"
 
 # The time stamp of the licence archives and SBOMs: the commit time of HEAD,
 # or SOURCE_DATE_EPOCH when set (the tagged commit's time, when the release
