@@ -262,7 +262,13 @@ types stay below 0x80.
 
 `key = pubkey[48] share_pubkey[48] index:u64`. `pubkey` is the validator's
 on-chain key; `share_pubkey` the key of the share this runner holds;
-`index` is `2^64-1` when unbound.
+`index` is `2^64-1` when unbound. A runner with `signing_mode = dv_share`
+lists each Charon share with `pubkey` = `share_pubkey`, the key its
+clients sign under ("Key rule lock"). There `pubkey` is not the on-chain
+key, and the protocol level stays 2: a gateway with the whole-key check
+reads an unknown `signing_mode` and refuses those keys, but a client that
+reads PUBLIC_KEYS without `signing_mode` (an older gateway,
+`signer-admin exit`) takes the share key for the validator key.
 
 ### SIGN kinds
 
@@ -514,8 +520,8 @@ Azure and GCP report no image set, so no check runs there.
 
 A signer holds keys alone (single-node, 1 of 1) only when its setup says
 so: `signing_mode`, a leaf of the public part of the setup (setup format
-2, `attestation-verify/docs/attestation-statement.md`), is `threshold` or
-`single`. The runner checks the split of every import order against it
+2, `attestation-verify/docs/attestation-statement.md`), is `threshold`,
+`single` or `dv_share` (below). The runner checks the split of every import order against it
 (`setupwire.CheckThresholdOn`, issue #23): a single-mode runner takes
 t = n = 1 only and refuses any share of a split with n > 1; a
 threshold-mode runner refuses t = n = 1 and applies the threshold rule
@@ -601,13 +607,79 @@ TestSetupMainnetGCPSingleNeedsNoLockAccepted, TestImportDraftSingleGCP,
 TestTwoSingleModeSignersRefused, TestImportDraftRepeatedShareIndex
 (signer-admin).
 
+`signing_mode = dv_share` (value 3) is for a runner that holds one share
+of each distributed validator of an Obol Charon cluster, whose other
+shares sit in other operators' signers. Only the dvt image variant runs
+it: a runner built with the Go build tag `dvt`, linked against the core
+built with `SC_DVT`. A default image refuses a dv_share setup at start
+("this image has no DVT support (built without dvt)"), and its strict
+share record reader refuses a record with `group_pubkey`. A dvt image
+runs dv_share setups only: it refuses a threshold or single setup at
+start and again when the config updates start ("this image is a DVT
+build and runs only dv_share setups"), so the DVT core never holds a
+whole key or a threshold share. A later DVT-only mode joins the same
+rule (`dvtModes`, tee-signer/server/variant.go). A runner built
+before dv_share refuses such a setup as an unknown `signing_mode`. The
+setup format stays 6, and setup tools of either variant read the mode.
+Its import orders and sealed
+imports are those of threshold mode: `pubkey` is the validator (group)
+key, the order names the cluster's t-of-n split (`setupwire.CheckThresholdOn`
+applies the threshold rules; no GCP acceptance is needed, as the runner
+holds a share, not the key, which rests on the approver-signed order),
+and the runner checks `share_pubkey` against the commitments at the share
+index. The runner cannot tell a Charon split from a made-up one: a whole
+validator key can be the share at the order's index of a split with a
+group key no cluster uses, and a dv_share runner that takes it signs
+alone for that validator without the single-mode rules. So the approvers
+check each group key of a dv_share order before they sign it: a validator
+on chain, or a key from a cluster lock they trust (`signer-admin`
+README, "Charon shares"). On a prod chain `signer-admin import-draft`
+also refuses a dv_share order unless chain data, from a beacon node or
+a fresh `chain-export` file of the setup's chain, shows every group key
+as a validator and no share key as one. That check trusts the node or
+the file and runs on the admin's machine; the approvers' check stays.
+The runner then stores and serves the
+share under `share_pubkey`, the key Charon's validator client asks for:
+PUBLIC_KEYS lists it with `pubkey` = `share_pubkey`, so the gateway sees a
+whole key, and marks, floors and policy apply to that key. The group key
+is sealed in the share record (`group_pubkey`) and given to the core
+(`sc_signer_add_validator_group`): the AGGREGATE_AND_PROOF and
+CONTRIBUTION_AND_PROOF kinds check the selection proof in the message,
+which Charon combined, against it. The partial selection proofs
+(AGGREGATION_SLOT, SYNC_COMMITTEE_SELECTION_PROOF) are signed with the
+share. A dv_share key without a group key, or a key with one under another
+mode, is refused at import and at restart. The group key never comes from
+a signing request: it is fixed at import by the approvers' order (its
+commitments hash) and the admin's cluster lock (`signer-admin dv-split`).
+The check only stops aggregates and contributions with a selection proof
+the group did not make; none of them is slashable. A builder registration
+of a dv_share key may name the share key or the group key (a Charon client
+registers the group key). Tests: TestDVShareImportAndSign,
+TestDVShareRegistrationPubkey, TestDVShareBatch,
+TestDVShareNeedsGroupKey, TestDVShareWrongIndexRefused,
+TestUpdatesRefuseOtherModesWithDVT (tee-signer/server),
+TestStartRefusesOtherModesWithDVT (tee-signer),
+TestSigningModeDVShare (setupwire), TestDVShareSelectionProof
+(signer-core/core), test_dv_share (signer-core test_unit), all built with
+the tag dvt or SC_DVT; TestStartRefusesDVShareWithoutDVT (tee-signer),
+TestShareRecordWithGroupKeyRefused, TestGroupKeyRefusedWithoutDVT,
+TestSingleModeRefusesGroupSelectionProof,
+TestSingleModeRefusesGroupRegistration (tee-signer/server) and
+scripts/dvt-test.sh for the default build; TestCheckSigningModeByVariant
+(tee-signer/server) for both. In a dvt build the tests of threshold and
+single setups skip (skipUnlessVariantRuns); the default build runs them.
+
 HEALTH reports the result as `key_lock`: `locked`, `not_locked`, `none`
 (GCP, dev) or `unread`, and the reason as `key_lock_why`. Next to them
 `single_key` says whether the signer holds a key alone where that is
 unsafe: on GCP `accepted` (the setup says
 `sealing_key_release.unsafe_single_key_accepted`) or `refused`, and `n/a`
-on the other platforms. `signing_mode` is the setup's `threshold` or
-`single`. Runners without a setup leave all four out. The
+on the other platforms. `signing_mode` is the setup's `threshold`,
+`single` or `dv_share`. Runners without a setup leave all four out.
+`variant` is the runner build's variant, `default` or `dvt` (only `dvt`
+runs `dv_share`); every runner since the split reports it, and older ones
+leave it out. It is a new optional field, so the protocol level stays 2.
+TestHealthNamesTheVariant (tee-signer/server). The
 setup state above does not carry them: its layout is the statement the
 circuits prove, and IDENTITY shares its version byte with ATTEST. So
 `key_lock` is not attested, and neither is `single_key`: the acceptance

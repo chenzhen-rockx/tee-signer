@@ -68,9 +68,15 @@ type Health struct {
 	Version  string `json:"version"`
 	// Protocol is the runner's ProtocolLevel. Runners before it leave it
 	// out; EffectiveProtocol reads that as level 1.
-	Protocol   int  `json:"protocol,omitempty"`
-	Ready      bool `json:"ready"`
-	Validators int  `json:"validators"`
+	Protocol int `json:"protocol,omitempty"`
+	// Variant is the runner build's variant: "default", or "dvt" for a
+	// build with the tag dvt, the only one that runs signing_mode =
+	// dv_share (docs/protocol.md, "Signing modes"). Unattested here: the
+	// image measurements tell the variants apart. Runners before it leave
+	// it out.
+	Variant    string `json:"variant,omitempty"`
+	Ready      bool   `json:"ready"`
+	Validators int    `json:"validators"`
 	// ConfigHash is the hash of the backend's config: Setup.SetupHash on a
 	// runner.
 	ConfigHash Root `json:"config_hash"`
@@ -99,8 +105,9 @@ type Health struct {
 	// and runners before it leave it out.
 	SingleKey string `json:"single_key,omitempty"`
 	// SigningMode is the setup's signing_mode: "threshold" (shares of
-	// t-of-n splits with n >= 2) or "single" (whole keys, 1 of 1 import
-	// orders only). Unlike single_key it is a leaf of the public part, so a
+	// t-of-n splits with n >= 2), "single" (whole keys, 1 of 1 import
+	// orders only) or "dv_share" (one share of each Charon distributed
+	// validator, served under the share key). Unlike single_key it is a leaf of the public part, so a
 	// verifier can also check it against the attested policy_root. Runners
 	// without a setup and runners before it leave it out.
 	SigningMode string `json:"signing_mode,omitempty"`

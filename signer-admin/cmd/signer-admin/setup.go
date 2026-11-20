@@ -16,18 +16,19 @@ import (
 )
 
 // The setup file is the human setup format of setupwire ("key = value",
-// setup format 2) with one
-// [signer NAME] section per signer. The lines before the first section
-// belong to every signer: setup_format_version, handover_generation, the
-// chain, the safety settings, max_keys, slashing_log_min_lock_days and both
-// config groups, and any platform key that is the same for all
-// (allowed_client_ca, for example). A section holds the keys of one signer:
-// platform, stores, sealing key release, network entry names. NAME becomes the
-// signer's signer_name. signing_mode (threshold or single) is shared: a
-// single-mode file has one section. The tool draws cluster_id and the salts: the policy
-// salts once for the cluster, so every signer with the same public values
-// has the same policy_root, and one platform salt per signer. So the file
-// names neither signer_name nor cluster_id nor any salt.
+// setup format 2) with one [signer NAME] section per signer. The lines
+// before the first section belong to every signer: setup_format_version,
+// handover_generation, the chain, the safety settings, max_keys,
+// slashing_log_min_lock_days and both config groups, and any platform key
+// that is the same for all (allowed_client_ca, for example). A section
+// holds the keys of one signer: platform, stores, sealing key release,
+// network entry names. NAME becomes the signer's signer_name. signing_mode
+// (threshold, single or dv_share) is shared: a single-mode file has one
+// section, and a dv_share file may have fewer signers than the Charon
+// cluster has operators. The tool draws cluster_id and the salts: the
+// policy salts once for the cluster, so every signer with the same public
+// values has the same policy_root, and one platform salt per signer. So
+// the file names neither signer_name nor cluster_id nor any salt.
 
 var sectionRE = regexp.MustCompile(`^\s*\[signer\s+([^\]\s]+)\s*\]\s*(#.*)?$`)
 
@@ -196,7 +197,9 @@ func cmdSetup(args []string, out io.Writer) error {
 	// the operator sees it when the setup is made, not only in the file.
 	for _, s := range setups {
 		k := &s.Platform.SealingKeyRelease
-		if err := setupwire.CheckThresholdOn(s, len(setups), len(setups)); err != nil {
+		// A dv_share cluster holds some shares of a Charon split whose other
+		// shares sit in signers outside this file, so its size bounds no split.
+		if err := setupwire.CheckThresholdOn(s, len(setups), len(setups)); err != nil && s.SigningMode != setupwire.SigningModeDVShare {
 			return fmt.Errorf("signer %s: a cluster of %d signer(s) can hold no key: %w", s.SignerName, len(setups), err)
 		}
 		if err := setupwire.CheckSingleKeyProd(&s.Platform, &s.Chain); err != nil {

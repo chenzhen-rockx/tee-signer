@@ -15,7 +15,9 @@ signer-admin exit -cluster cluster.json -split split.json -pubkey 0x... -index 1
 curl -X POST -H 'Content-Type: application/json' --data @exit.json http://BEACON:5052/eth/v1/beacon/pool/voluntary_exits
 ```
 
-Every setup file says `signing_mode`: `threshold` (the signers hold shares of t-of-n splits, n >= 2) or `single` (one signer holds whole keys). One key is held by one runner: `signer-admin setup` refuses `single` with more than one signer and `threshold` with one, every tool that reads `cluster.json` refuses a single-mode cluster of more than one signer, and `import-draft` refuses a split file that gives one share index to two signers, or a split that does not fit the target's mode, as its runner does. `signer-admin setup` refuses a single-mode file whose signer is on GCP: that signer would hold keys alone (1 of 1), which is unsafe there (Cloud KMS has no lock on the key release rule). `-allow-gcp-unsafe-single-key` accepts the risk in the setup of such a one-signer GCP file and prints a WARNING line (a threshold file, or a signer that is not on GCP, refuses the flag); so does the key `sealing_key_release.unsafe_single_key_accepted = true` in the signer's section, which `setup-tool encode` warns about too. On mainnet the setup also needs `sealing_key_release.no_lock_accepted = true`, or it is refused: without it the runner would not start. `signer-admin import-draft` refuses a `not_after` more than 7 days from now: a runner takes shares under an order until its `not_after`, so keep it short. It drafts a 1 of 1 order to a GCP signer only with `-allow-gcp-unsafe-single-key`, and `show` prints the warning to each approver. Why, and what it means: [platform-gcp/deploy/README.md](../platform-gcp/deploy/README.md#setup), "Setup".
+`-pubkey` is the validator key. For a dv_share cluster that is the group key (`distributed_public_key`): each dv_share signer lists its share under the share's own key and signs with it, and `exit` refuses a share key with a message that names its share index and group key. For the Obol exit flow see [Exits of dv_share keys](#exits-of-dv_share-keys).
+
+Every setup file says `signing_mode`: `threshold` (the signers hold shares of t-of-n splits, n >= 2), `single` (one signer holds whole keys) or `dv_share` (each signer holds one share of each validator of a Charon cluster, [below](#charon-shares-signing_mode--dv_share)). One key is held by one runner: `signer-admin setup` refuses `single` with more than one signer and `threshold` with one, every tool that reads `cluster.json` refuses a single-mode cluster of more than one signer, and `import-draft` refuses a split file that gives one share index to two signers, or a split that does not fit the target's mode, as its runner does. `signer-admin setup` refuses a single-mode file whose signer is on GCP: that signer would hold keys alone (1 of 1), which is unsafe there (Cloud KMS has no lock on the key release rule). `-allow-gcp-unsafe-single-key` accepts the risk in the setup of such a one-signer GCP file and prints a WARNING line (a threshold file, or a signer that is not on GCP, refuses the flag); so does the key `sealing_key_release.unsafe_single_key_accepted = true` in the signer's section, which `setup-tool encode` warns about too. On mainnet the setup also needs `sealing_key_release.no_lock_accepted = true`, or it is refused: without it the runner would not start. `signer-admin import-draft` refuses a `not_after` more than 7 days from now: a runner takes shares under an order until its `not_after`, so keep it short. It drafts a 1 of 1 order to a GCP signer only with `-allow-gcp-unsafe-single-key`, and `show` prints the warning to each approver. Why, and what it means: [platform-gcp/deploy/README.md](../platform-gcp/deploy/README.md#setup), "Setup".
 
 Module path `github.com/lidofinance/tee-signer/signer-admin`, with its own `go.mod`. It uses other modules of this repo only through their public packages (`scripts/check-imports.sh`).
 
@@ -88,3 +90,113 @@ Any t of the `shares.txt` files are the whole keys, so they never travel togethe
 6. Right after the import succeeds, delete the file: `umount DIR` for the tmpfs folder, and `shred -u` the copy on the media (shred overwrites in place, which works on a plain filesystem on a flash stick or a hard disk; an SSD or a journaling or copy-on-write filesystem may keep old blocks, so treat such media as still holding the share and keep or destroy it as a secret).
 
 After the last signer, delete `OUT` on the dealer machine (`umount` its tmpfs) and do not reboot into a hibernation image that was made while it existed.
+
+## Charon shares (signing_mode = dv_share)
+
+A signer behind an Obol Charon node holds that node's share of each distributed validator. Charon's validator client asks for each share under the share's own key, and the aggregates and sync contributions it sends carry the selection proof the cluster combined, which verifies under the validator's group key. A setup with `signing_mode = dv_share` serves such shares: the runner signs under the share key and checks those selection proofs against the group key. Marks, floors and every other rule apply to the share key as for any key.
+
+The group key comes from the import, never from a request. `dv-split` reads the cluster lock and writes the split file:
+
+```
+signer-admin dv-split -lock cluster-lock.json -signers NAME=INDEX[,NAME=INDEX...] [-out split.json]
+```
+
+- For each validator it takes `distributed_public_key` (the group key) and `public_shares` (share index i + 1 at position i), computes the t commitments of the split from the first t public shares (t is the lock's `threshold`), and checks that commitment 0 is the group key and that every one of the n public shares is the commitments' value at its index. A lock that fails any check writes nothing.
+- `-signers` gives each dv_share signer of `cluster.json` the Charon share index it holds: its operator's position in the lock, from 1.
+- dv-split does not check the lock's signatures or `lock_hash` yet. The admin vouches for the file; the approvers sign the commitments hash that `import-draft` puts in the order for each group key.
+
+Before they sign an import order for a dv_share signer, the approvers check each group key the order names: it is a validator on chain, or it comes from a cluster lock they trust. The runner cannot tell a Charon split from one made up for the purpose. Anyone who holds a whole validator key can make up a split in which that key is the share at the order's index, with a group key no cluster uses. A dv_share runner that takes it serves the whole key under its own key and signs alone for that validator, without the single-mode rules: no GCP acceptance, no one-signer cluster check. On a prod chain `import-draft` also runs a chain check on the admin's side (below); it does not replace the approvers' check.
+
+Then per signer, as for a split: `import-draft -split split.json -lock cluster-lock.json`, the approvers `show` and `sign`, `assemble`, and `import -order import.signed -commitments split.json -shares FILE`. The shares file may name each share by its own key, as for a single-mode import (`0x<share pubkey> <validator index> 0x<share secret>`): `import` files each share of the order's index under its group key and says how many it filed. The shares file may also name each share by its group key, as for a threshold import. `-interchange` looks each share up under its own key, the key a Charon validator client's slashing protection file uses, and `-skip-loaded` leaves out the shares the runner lists under their own key. A runner holds one share of each group key: it refuses a second one. It also refuses a key that is the group key of a share it holds, and a share whose group key is a key it holds, so it never holds a validator key next to a share of it. Two shares of one validator under two made-up group keys it cannot see: the approvers check the group keys.
+
+For a dv_share signer `import-draft` needs `-lock`: each validator of the split file must be one of the lock's, with the commitments dv-split makes from it, so the signer's share is the lock's public share at its index.
+
+The chain check then looks up each share key and group key of the order, on a beacon node (`-beacon URL`) or in a file of `chain-export` (`-chain-file chain.json`). A share key that is a validator is refused: a whole key would go in as a share. A group key that is unknown, not active or slashed gets a warning, except as below on a prod chain. A status that is not a validator status of the beacon API is refused, from the node or in the file. A node must serve the setup's chain (same `genesis_validators_root` and `genesis_fork_version`) and be current, or the check fails: `/eth/v1/node/syncing` says `is_syncing`, `is_optimistic` and `el_offline` false, and the head slot, timed from `genesis_time` and `SECONDS_PER_SLOT`, started at most 15 minutes before the machine's clock. A node that lost its peers or its execution client can still say `is_syncing` false while its head falls behind, and does not know the validators deposited since.
+
+- On a prod chain (mainnet, or any chain the chain table does not list) the chain check is required. Without `-beacon` or `-chain-file` `import-draft` refuses, `-yes` does not replace the check, and every group key of the order must be a validator on chain that is not slashed or exited (`active_exiting` still passes). A `-beacon` error there says the check is required instead of offering to drop `-beacon`. Deposit a new cluster's validators before the import.
+- On a non-prod chain the check is optional, and without it `import-draft` says the lookup was skipped. When no chain check backs the keys (no check, or one that does not find every group key), `import-draft` asks once on the terminal to confirm that they are shares from a Charon cluster, not whole validator keys, and writes the order only on `y` or `yes`. `-yes` confirms without the question, for scripts.
+
+To draft on a machine without network, export the chain data on a machine with a beacon node and carry the file over:
+
+```
+signer-admin chain-export -beacon URL -lock cluster-lock.json -out chain.json
+```
+
+The file lists every group key and public share of the lock with the node's status for it (`not_found` for a key the node does not know), the chain's `genesis_validators_root` and `genesis_fork_version`, the node's head slot and epoch, the start of the head slot (`head_time`), and the time of the export. It holds public keys only. chain-export refuses a node that `-beacon` would refuse, so the head time is at most 15 minutes before the export. `import-draft -chain-file chain.json` refuses a file of another chain (either genesis value differs from the setup's), a file that does not list every key of the order, and a file whose head time or export time is more than 24 hours old or more than 5 minutes ahead of the drafting machine's clock. The age counts from the head time: a file exported today from a node stalled yesterday is stale. It also refuses a file of format 1, which has no head time. A key that became a validator after the head is not in the file, so export again for a later draft.
+
+The chain check trusts the beacon node or the file. It does not replace the approvers' check of each group key: a beacon node can only say that a key is a validator, not that the cluster is the one the operator runs. The lock's `lock_hash` and the operators' signatures are not checked.
+
+The runner checks the share against the order's commitments at the order's share index (`share_pubkey` must be their value there, and commitment 0 is the group key), seals the group key into the share record and lists the share under its own key in PUBLIC_KEYS. The gateway sees a whole key. The group key check only stops aggregates and contributions with a selection proof the group did not make; none of these messages is slashable.
+
+The split must pass the chain's threshold rule as for threshold mode: on mainnet (and any chain the chain table does not list) 2t - n >= 2, so Charon's 3 of 4, 5 of 7 and 7 of 10 pass and a 2-of-3 cluster is refused.
+
+The gateway serves a dv_share key as a whole key (PUBLIC_KEYS lists `pubkey` = `share_pubkey`): its whole-key check takes `signing_mode = dv_share` as it takes `single` ([gateway/README.md](../gateway/README.md)). A gateway older than that refuses the keys. A builder registration of a dv_share key may name the share key or the group key (a Charon validator client registers the group key); the gateway leaves that check to the runner, which knows the group key, and applies its fee recipient allowlist as for any key.
+
+The tee-signer cluster of a dv_share setup may have any number of signers, since the other shares of each split sit in other operators' signers. A dv_share setup on GCP needs no `unsafe_single_key_accepted`: the signer holds one share, not the key, as long as the approvers checked each group key before they signed its order (above).
+
+### From signing_mode = single
+
+A signer that holds Charon shares as whole keys under `signing_mode = single` signs attestations and blocks, but refuses every aggregate and sync contribution: their selection proof is the group's, not the share's. To move it:
+
+1. Write a setup that says `signing_mode = dv_share` and run `signer-admin setup`. It is a new setup, with a new `setup_sha256`; the approvers check and approve it as any new setup.
+2. Start the runner on it with new stores, or remove the old share records (`shares/...` in the encrypted state store) first. Records sealed under the old setup do not open under the new one. A runner that lists records it cannot open takes no import but one batch that holds every listed key. dv_share records have the same names (the share keys), so an `import` of all of them works only while they fit one batch (1024 shares and one frame); with more, remove the old records.
+3. `signer-admin dv-split -lock cluster-lock.json -signers NAME=INDEX -out split.json`.
+4. `import-draft -lock cluster-lock.json [-beacon URL | -chain-file chain.json] [-yes]`, approvals and `assemble` as above. On a prod chain `-beacon` or `-chain-file` is required.
+5. `signer-admin import -cluster cluster.json -signer NAME -order import.signed -commitments split.json -shares FILE [-interchange FILE]`, with the shares file of the single-mode import.
+
+Each key starts with the restart floor of the import, so the signer misses the duties of a restart.
+
+### Exits of dv_share keys
+
+A distributed validator exits with t partial exits, each signed with one operator's share. In an Obol cluster the Obol API stores the partials, and each operator's `charon exit fetch` combines t of them into the full exits that its validator ejector reads. Operators with keystores keep using `lido-dv-exit` or `charon exit sign`. An operator whose share sits in a dv_share signer signs its partials with its admin certificate and posts them from its Charon host. Both kinds of operators can be in one cluster: all partials meet in the Obol API.
+
+The commands below come with the build tag `dvt`. `make admin DVT=1` builds `build/<arch>/bin/signer-admin-dvt` (after `make core DVT=1`); `make admin` builds the default `signer-admin`, which does not have them.
+
+A partial exit needs the validator index, so the steps repeat for each deposit batch, once the deposits are on chain:
+
+1. On a machine with a beacon node, no certificate needed:
+
+   ```
+   signer-admin dv-indices -lock cluster-lock.json -beacon URL -out indices.json
+   ```
+
+   It checks that the node is synced and on the lock's chain (`fork_version`), and writes the index of each validator of the lock that the node knows, in the form of the beacon API's `GET /eth/v1/beacon/states/head/validators` answer. A saved answer of that endpoint works as the file too.
+
+2. On the admin machine, with the signer's admin connection file:
+
+   ```
+   signer-admin dv-exit -cluster cluster.json -signer NAME -split split.json -lock cluster-lock.json -indices indices.json -pubkeys batch.txt [-epoch E] -out NAME-exits.json
+   ```
+
+   - `-split` is the file of `dv-split`; it gives NAME's share index. The lock must be the one the split came from.
+   - `-pubkeys` names the batch, one group key per line; `-all` instead takes every validator of the lock. Without one of them `dv-exit` refuses. Every validator of the batch needs an index, or nothing is signed. A share key in the list is refused with its share index and group key.
+   - After every check, before the first signature, `dv-exit` prints the batch: the count, the signer and its share index, the epoch, the lock hash, the chain and each validator's index and key. It signs only when you type `yes`, on a new connection, so a long wait at the question does not run into the signer's idle timeout. `-yes` skips the question for scripts; without `-yes`, a stdin that is not a terminal is refused. `-check` runs every check, prints the batch and stops: nothing is signed or written, and `-out` is not needed. A partial exit stays valid at every later epoch and the Obol API keeps what it gets, so check the batch before you answer.
+   - `-epoch` defaults to 194048 on mainnet and 256 on Hoodi, the epochs Obol's Lido node setup gives `lido-dv-exit`. Every operator of the cluster must use the same epoch: the Obol API keeps the first epoch it gets for a validator. The signer signs in its chain's `voluntary_exit_fork_version` domain, the Capella one (EIP-7044), which is the domain Charon and the Obol API use at any epoch.
+   - The setup of NAME must say `signing_mode = dv_share`, and the signer must list each share under the share's own key. `dv-exit` checks every share before it signs anything, then checks each partial under its share key. A partial the signer refuses is reported; the others are written and the command exits non-zero.
+   - `-beacon URL` instead of `-indices` asks a node of the signer's chain.
+   - The output holds the Obol API's `partial_exits` and `share_idx`, with the lock hash and the domain's values. It is not secret.
+
+3. Copy the file to the Charon host and post it there:
+
+   ```
+   signer-admin dv-exit-post -lock .charon/cluster-lock.json -enr-key .charon/charon-enr-private-key NAME-exits.json
+   ```
+
+   Before it sends anything it checks: the file's `lock_hash` is the lock's; each public key is a validator of the lock; each partial verifies under the lock's public share at `share_idx` in the chain's exit domain; the ENR key belongs to operator `share_idx` of the lock. It then signs the request with the ENR key, as `charon exit sign` does, and sends `POST /exp/partial_exits/{lock_hash}` to `-api` (default `https://api.obol.tech/v1`, the address Charon uses).
+
+   - The exit domain: on mainnet and Hoodi the tool knows it from the lock's `fork_version`. For another chain it refuses unless `-domain` (its voluntary exit domain), or `-fork-version` (the chain's Capella fork version) with `-genesis-root` (its genesis validators root), names it, and the files must agree with what you give.
+   - The key file must have mode 0600 and belong to the user who runs the tool; the tool reads it on that host only and never prints it. Run the tool as the user that owns the key, the one Charon runs as (for example `sudo -u USER signer-admin dv-exit-post ...`), not as root, and do not chown the key: Charon must still read it.
+   - `-api` takes https, or http to a host whose every address is a loopback one. The tool resolves the name again when it connects and connects only to such an address. It follows no redirect. An error answer of the API is cut to 200 characters, without control characters, before it is printed.
+   - The tool does not recompute the lock's `lock_hash`: Charon's hash covers the whole lock in a layout that changes with the lock's version. The Obol API checks each partial against the public shares of the cluster with that hash.
+
+   Before it signs the request it prints the batch: the count, `share_idx`, the lock hash, the URL, the chain and each validator's index, epoch and key. It posts only when you type `yes`; `-yes` and `-check` work as for `dv-exit`.
+
+4. Once t operators have posted, each operator fetches the full exits on its Charon host into the folder its validator ejector reads (`./validator-ejector` in Obol's Lido node setup):
+
+   ```
+   charon exit fetch --all --fetched-exit-path ./validator-ejector --lock-file .charon/cluster-lock.json --private-key-file .charon/charon-enr-private-key --beacon-node-endpoints URL
+   ```
+
+   `charon exit fetch` writes `exit-<pubkey>.json`, the beacon API body the ejector reads, with mode 0600; make the files readable by the user the ejector runs as.
+
+Security: after step 4 every operator's ejector folder holds the full exit of every validator of the cluster, as in the stock Obol and Lido flow. Whoever can read one operator's folder can exit all of those validators, so the stored exits are 1 of n whatever t is. The signer keeps the share and the partial signing behind the admin certificate, but does not change this part. The advice above to keep only a few pre-signed exits does not fit this flow.

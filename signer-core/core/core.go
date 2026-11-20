@@ -1,6 +1,7 @@
 // Package core is the cgo binding to the portable C signer core
 // (signer-core, see core/README.md). It needs the static libraries that
-// scripts/build-core.sh puts in build/<arch>/lib.
+// scripts/build-core.sh puts in build/<arch>/lib: libsigner_core.a
+// (corelib.go), or with the build tag dvt libsigner_core_dvt.a (dvt.go).
 //
 // The runner and the software backend both sign through this package, so
 // slashing protection and policy are the same C code in both.
@@ -8,8 +9,6 @@ package core
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../include
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/../../build/x86_64/lib -lsigner_core -lblst
-#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../../build/aarch64/lib -lsigner_core -lblst
 #include <stdlib.h>
 #include <string.h>
 #include "signer_core.h"

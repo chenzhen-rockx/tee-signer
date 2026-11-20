@@ -40,14 +40,18 @@ func New(feeRecipientAllowlist []string) (*Policy, error) {
 }
 
 // Check returns a *RefusedError when the job for pubkey must not be signed.
-func (p *Policy) Check(pubkey phase0.BLSPubKey, job *signing.Job) error {
+// dvShare says pubkey is a dv_share key (backend.Signer.DVShare): its
+// registration may name the share key or the group key, which the gateway
+// does not know, so its signer checks the registration's key. The other
+// checks apply to it as to any key.
+func (p *Policy) Check(pubkey phase0.BLSPubKey, dvShare bool, job *signing.Job) error {
 	switch job.Type {
 	case signing.TypeVoluntaryExit:
 		// Only the admin role signs an exit, at the signers (signer-admin exit).
 		return &RefusedError{Reason: "voluntary exits are never signed by this gateway"}
 	case signing.TypeValidatorRegistration:
 		reg := job.Registration
-		if reg.Pubkey != pubkey {
+		if reg.Pubkey != pubkey && !dvShare {
 			return &RefusedError{Reason: fmt.Sprintf("registration pubkey %#x differs from signing key %#x", reg.Pubkey, pubkey)}
 		}
 		if !p.feeRecipients[reg.FeeRecipient] {

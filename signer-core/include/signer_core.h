@@ -630,6 +630,37 @@ int sc_signer_add_validator(sc_signer *s, const uint8_t pubkey[SC_PUBKEY_LEN],
                             const uint8_t secret[SC_SECRET_LEN], uint64_t validator_index,
                             uint8_t share_pubkey_out[SC_PUBKEY_LEN]);
 
+#ifdef SC_DVT
+/*
+ * DVT build only (SC_DVT, make core DVT=1). The default build has no such
+ * function, so a caller built for DVT does not link against it.
+ *
+ * sc_signer_add_validator for a share of a distributed validator whose
+ * other parts the core does not see (an Obol/Charon cluster): pubkey is the
+ * share's own public key, which the client signs under, and group_pubkey the
+ * validator's on-chain (group) key. The aggregate and contribution calls
+ * then check the selection proof in the message against group_pubkey, the
+ * proof the cluster combined, instead of pubkey, and
+ * sc_sign_validator_registration also takes a registration that names
+ * group_pubkey. Everything else (marks, policy, the partial selection
+ * proofs) works on pubkey as for any key. group_pubkey NULL is
+ * sc_signer_add_validator. SC_ERR_BAD_KEY, with nothing loaded, if
+ * group_pubkey is not a G1 point or is the point at infinity.
+ */
+int sc_signer_add_validator_group(sc_signer *s, const uint8_t pubkey[SC_PUBKEY_LEN],
+                                  const uint8_t secret[SC_SECRET_LEN], uint64_t validator_index,
+                                  const uint8_t group_pubkey[SC_PUBKEY_LEN],
+                                  uint8_t share_pubkey_out[SC_PUBKEY_LEN]);
+
+/*
+ * DVT build only: marks the DVT core. The default Go binding
+ * (core/corelib.go) defines the same symbol, so a default runner linked
+ * against a DVT core fails with a multiple definition, as a DVT runner
+ * linked against a default core fails on sc_signer_add_validator_group.
+ */
+extern const char sc_core_dvt_marker[];
+#endif /* SC_DVT */
+
 /*
  * EIP-3076 minimal import for one loaded validator. The caller parses the
  * interchange file and passes its metadata.genesis_validators_root, which

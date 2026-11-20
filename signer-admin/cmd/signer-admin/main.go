@@ -68,7 +68,7 @@
 //	    type no runner serves tells a role-checking image from an older
 //	    one, an empty CONFIG_UPDATE tells the admin role from the others.
 //	    Changes nothing. Run it before every order or import.
-//	signer-admin import-draft -cluster cluster.json -signer NAME -split FILE [-not-after 12h] [-allow-gcp-unsafe-single-key] [-out import.bin]
+//	signer-admin import-draft -cluster cluster.json -signer NAME -split FILE [-lock cluster-lock.json [-beacon URL | -chain-file chain.json] [-yes]] [-not-after 12h] [-allow-gcp-unsafe-single-key] [-out import.bin]
 //	    Draft an import order for one target signer: its setup_sha256, t, n,
 //	    its share index and, per validator, the hash of the t commitments.
 //	    The split file gives each signer its own share index, 1 to n
@@ -81,6 +81,13 @@
 //	    WARNING line (setupwire.UnsafeSingleKeyWarning); show prints the
 //	    same line to each approver. show, sign and assemble take it as
 //	    they take an order.
+//	    For a dv_share signer -lock is required, and the chain check
+//	    (chaincheck.go) looks up each group key and share key: -beacon
+//	    asks a beacon node, -chain-file reads the file of chain-export. A
+//	    share key that is a validator is refused. On a prod chain the check
+//	    is required and every group key must be a validator, not slashed
+//	    or exited; on a non-prod chain it is optional and the admin
+//	    confirms the keys without it (or -yes).
 //	signer-admin import -cluster cluster.json -signer NAME -order import.signed -shares FILE -commitments FILE
 //	    Probe the role, check the runner's attestation, seal each share of
 //	    FILE (mode 0600) to the attested import key and send them under
@@ -102,6 +109,10 @@
 //	    even when fewer than t. If a selected signer fails, it still
 //	    writes the file but exits non-zero. Each admin certificate holder
 //	    runs it with their own certificate. The file is not secret.
+//	    -pubkey is the validator key: for a dv_share cluster the group
+//	    key. A dv_share signer lists its share under the share's own key
+//	    (the split's value at its index) and signs with that key; a share
+//	    key in -pubkey is refused with the share index and group key.
 //	signer-admin exit-combine -split FILE [-pubkey 0x...] [-index N] [-epoch E] -out exit.json PARTIALS...
 //	    Offline: read the files of exit -partial-out, check that they name
 //	    the same exit and chain (and -pubkey, -index, -epoch if given),
@@ -118,6 +129,24 @@
 //	    OUT/shares/NAME/shares.txt (mode 0600) for import -shares and
 //	    OUT/manifest.json (split.go). OUT must be a new folder on tmpfs;
 //	    swap must be off (or -allow-swap), core dumps are turned off.
+//	signer-admin dv-split -lock cluster-lock.json -signers NAME=INDEX[,NAME=INDEX...] [-out split.json]
+//	    For dv_share signers: read a Charon cluster lock, interpolate each
+//	    validator's commitments from its public shares, check every public
+//	    share and the group key against them, and write the split file of
+//	    import-draft and import (dvsplit.go). import then takes a shares
+//	    file that names each share by its own key, as for single mode.
+//	signer-admin chain-export -beacon URL -lock cluster-lock.json [-out chain.json]
+//	    For the chain check of import-draft -chain-file on a machine
+//	    without network: ask a synced beacon node about every group key
+//	    and public share of the lock and write its answer, the chain's
+//	    genesis values, the head slot, epoch and time, and the time
+//	    (chaincheck.go). It refuses a node whose head is more than 15
+//	    minutes behind the clock, or that is optimistic or has its
+//	    execution client offline. import-draft takes the file for at
+//	    most 24 hours from the head time.
+//	signer-admin dv-indices, dv-exit, dv-exit-post
+//	    With the build tag dvt only: the exit route of dv_share signers
+//	    through the Obol API (dvexit.go, dvpost.go).
 //	signer-admin issue-client-cert -ca-cert FILE -ca-key FILE -role admin|attest|signing -name CN -out DIR
 //	signer-admin issue-client-cert -ca-cert FILE -ca-key FILE -make-intermediate ROLE -name CN -out DIR
 //	    Issue one client certificate of a role, or a role intermediate from
@@ -197,26 +226,40 @@ const usage = `usage:
   signer-admin assemble [-active FILE] [-out update.signed] update.bin SIG...
   signer-admin push -cluster cluster.json [-raise-min] [-signers NAME,...] [-drop-running-image NAME,...] update.signed
   signer-admin probe -cluster cluster.json [-signers NAME,...]
-  signer-admin import-draft -cluster cluster.json -signer NAME -split FILE [-not-after 12h] [-allow-gcp-unsafe-single-key] [-out import.bin]
+  signer-admin import-draft -cluster cluster.json -signer NAME -split FILE [-lock cluster-lock.json [-beacon URL | -chain-file chain.json] [-yes]] [-not-after 12h] [-allow-gcp-unsafe-single-key] [-out import.bin]
   signer-admin import -cluster cluster.json -signer NAME -order import.signed -shares FILE -commitments FILE
   signer-admin exit -cluster cluster.json [-signers NAME,...] [-split FILE] -pubkey 0x... -index N -epoch E -out exit.json|-partial-out FILE
   signer-admin exit-combine -split FILE [-pubkey 0x...] [-index N] [-epoch E] -out exit.json PARTIALS...
   signer-admin split -keystores DIR -password-file FILE -t T -n N -signers NAME,... [-chain mainnet|hoodi|devnet|ci-test] [-expect FILE] [-allow-swap] -out DIR
+  signer-admin dv-split -lock cluster-lock.json -signers NAME=INDEX[,NAME=INDEX...] [-out split.json]
+  signer-admin chain-export -beacon URL -lock cluster-lock.json [-out chain.json]
   signer-admin issue-client-cert -ca-cert FILE -ca-key FILE -role admin|attest|signing|-make-intermediate ROLE -name CN -out DIR`
+
+// dvtCommands and dvtUsage are the commands of a build with the tag dvt
+// (dvexit.go): the exit route of dv_share signers. A default build has
+// none.
+var (
+	dvtCommands map[string]func([]string, io.Writer) error
+	dvtUsage    string
+)
 
 func run(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New(usage)
+		return errors.New(usage + dvtUsage)
 	}
 	cmds := map[string]func([]string, io.Writer) error{
 		"setup": cmdSetup, "pin": cmdPin, "status": cmdStatus, "draft": cmdDraft,
 		"show": cmdShow, "sign": cmdSign, "assemble": cmdAssemble, "push": cmdPush,
 		"probe": cmdProbe, "import-draft": cmdImportDraft, "import": cmdImport, "exit": cmdExit, "exit-combine": cmdExitCombine, "split": cmdSplit,
+		"dv-split": cmdDVSplit, "chain-export": cmdChainExport,
 		"issue-client-cert": cmdIssueClientCert, "approver-key": cmdApproverKey,
+	}
+	for name, cmd := range dvtCommands {
+		cmds[name] = cmd
 	}
 	cmd, ok := cmds[args[0]]
 	if !ok {
-		return fmt.Errorf("unknown subcommand %q\n%s", args[0], usage)
+		return fmt.Errorf("unknown subcommand %q\n%s", args[0], usage+dvtUsage)
 	}
 	return cmd(args[1:], out)
 }
