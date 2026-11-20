@@ -10,6 +10,8 @@
 #   lane          release/build.sh fetch, and the checks at the start of
 #                 release/release-build.sh
 #   compare       release/compare.sh
+#   frontend      the first line of the measured image Dockerfiles, and
+#                 need_frontend_pin (scripts/common.sh) in the image builds
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
@@ -195,7 +197,7 @@ EOF
   # cross nm is always the aarch64 one.
   local hstub="$TMP/lane-host" cross_nm=aarch64-linux-gnu-nm p
   mkdir -p "$hstub"
-  for p in nm aarch64-linux-gnu-nm x86_64-linux-gnu-nm readelf file cc jq ip; do
+  for p in nm aarch64-linux-gnu-nm x86_64-linux-gnu-nm readelf file cc jq ip envsubst; do
     printf '#!/bin/sh\nexit 0\n' >"$hstub/$p"
   done
   cat >"$hstub/uname" <<'EOF'
@@ -334,6 +336,11 @@ EOF
   hide="$cross_nm"
   lane "release-build: refuses a host without $cross_nm" stop
   if grep -q "$cross_nm.*binutils-" "$TMP/out"; then ok "release-build: names the package of $cross_nm"; else bad "release-build: names the package of $cross_nm: $(tail -n 1 "$TMP/out")"; fi
+  # scripts/kms-policy.sh renders the KMS policy with envsubst.
+  repo
+  hide=envsubst
+  lane "release-build: refuses a host without envsubst" stop
+  if grep -q 'envsubst.*gettext-base' "$TMP/out"; then ok "release-build: names the package of envsubst"; else bad "release-build: names the package of envsubst: $(tail -n 1 "$TMP/out")"; fi
   repo
   lane "release-build: refuses a host where unshare -rn fails" stop FAKE_UNSHARE_FAIL=1
   if grep -q 'kernel.apparmor_restrict_unprivileged_userns' "$TMP/out"; then ok "release-build: names the userns sysctl"; else bad "release-build: names the userns sysctl: $(tail -n 1 "$TMP/out")"; fi
@@ -464,13 +471,71 @@ t_compare() {
   if grep -q '^same' "$TMP/out"; then bad "compare: printed same for an empty folder"; fi
 }
 
+# The GCP and Azure image Dockerfiles name the Dockerfile frontend by
+# version and digest on their first line, and both name the same one.
+# Without that line the build uses the frontend built into the host's
+# Docker, and the image config, so the digest, follows the host's Docker
+# version (EXPOSE in the history changed with docker/dockerfile 1.29.0).
+t_frontend() {
+  local f first want=""
+  for f in platform-gcp/deploy/Dockerfile platform-azure/deploy/Dockerfile; do
+    first="$(head -n 1 "$HERE/../$f")"
+    if [[ ! "$first" =~ ^#\ syntax=docker/dockerfile:[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$ ]]; then
+      bad "frontend: $f does not start with '# syntax=docker/dockerfile:VERSION@sha256:DIGEST': '$first'"
+    elif [ -n "$want" ] && [ "$first" != "$want" ]; then
+      bad "frontend: $f names another frontend than the GCP Dockerfile: '$first'"
+    else
+      ok "frontend: $f pins the Dockerfile frontend"
+      want="$first"
+    fi
+  done
+
+  # The build scripts check the same line in the Dockerfile they build
+  # (need_frontend_pin in scripts/common.sh), after the build overlay's
+  # image hook, which may change the build context.
+  local d="$TMP/frontend" pin s hook chk build
+  mkdir -p "$d"
+  pin="$(head -n 1 "$HERE/../platform-gcp/deploy/Dockerfile")"
+  printf '%s
+FROM scratch
+' "$pin" >"$d/pinned"
+  printf 'FROM scratch
+' >"$d/none"
+  printf '# syntax=docker/dockerfile:1.29.0
+FROM scratch
+' >"$d/tag"
+  printf 'FROM scratch
+%s
+' "$pin" >"$d/second"
+  expect "frontend: need_frontend_pin takes a pinned Dockerfile" 0 frontend_pin "$d/pinned"
+  refuses "frontend: need_frontend_pin refuses a Dockerfile without the pin" "does not start with" frontend_pin "$d/none"
+  refuses "frontend: need_frontend_pin refuses a version without a digest" "does not start with" frontend_pin "$d/tag"
+  refuses "frontend: need_frontend_pin refuses the pin on line 2" "does not start with" frontend_pin "$d/second"
+  for s in gcp azure; do
+    f="$HERE/../platform-$s/deploy/build-image.sh"
+    hook="$(grep -n "^devnet_hook ${s}_image_ctx " "$f" | cut -d: -f1 || true)"
+    chk="$(grep -n '^need_frontend_pin "$CTX/Dockerfile" || die ' "$f" | cut -d: -f1 || true)"
+    build="$(grep -n '^d1="$(build_once 1)"' "$f" | cut -d: -f1 || true)"
+    if [ -n "$hook" ] && [ -n "$chk" ] && [ -n "$build" ] && [ "$hook" -lt "$chk" ] && [ "$chk" -lt "$build" ]; then
+      ok "frontend: platform-$s build-image.sh checks the pin after the overlay hook, before the build"
+    else
+      bad "frontend: platform-$s build-image.sh does not run need_frontend_pin on \$CTX/Dockerfile between the overlay hook and the build (lines: hook '$hook', check '$chk', build '$build')"
+    fi
+  done
+}
+# frontend_pin FILE: need_frontend_pin of scripts/common.sh on FILE.
+frontend_pin() {
+  env -u SIGNER_BUILD_OVERLAY_DIR CHAIN=mainnet bash -c '. "$1/scripts/common.sh" && need_frontend_pin "$2"' _ "$HERE/.." "$1"
+}
+
 sections=("$@")
-[ ${#sections[@]} -gt 0 ] || sections=(measurements lane compare)
+[ ${#sections[@]} -gt 0 ] || sections=(measurements lane compare frontend)
 for s in "${sections[@]}"; do
   case "$s" in
     measurements) t_measurements ;;
     lane) t_lane ;;
     compare) t_compare ;;
+    frontend) t_frontend ;;
     *) echo "release-test: unknown section $s" >&2; exit 2 ;;
   esac
 done

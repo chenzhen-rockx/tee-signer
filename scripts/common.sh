@@ -378,6 +378,20 @@ run_build_runner() {
     "$SIGNER_BUILDER_IMAGE" bash scripts/build-runner.sh "$@"
 }
 
+# need_frontend_pin DOCKERFILE: the first line of DOCKERFILE names the
+# Dockerfile frontend by version and digest
+# (# syntax=docker/dockerfile:X.Y.Z@sha256:DIGEST). Without that line the
+# frontend built into the host's Docker writes the image config. The image
+# builds (platform-*/deploy/build-image.sh) run it on the Dockerfile they
+# build, and release/release-test.sh tests it.
+need_frontend_pin() {
+  local first
+  first="$(head -n 1 "$1")"
+  [[ "$first" =~ ^#\ syntax=docker/dockerfile:[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$ ]] && return 0
+  echo "$1 does not start with '# syntax=docker/dockerfile:VERSION@sha256:DIGEST': '$first'" >&2
+  return 1
+}
+
 # setup_value FILE KEY: the first value of KEY in the human form of a setup.
 setup_value() {
   setup_tool show "$1" | sed -n "s/^$2 = //p" | head -n 1

@@ -27,6 +27,12 @@
 # and no provenance or SBOM attestations, as in scripts/nitro-eif.sh. The
 # file modes are explicit (the Dockerfile's COPY --chmod, and install -m on
 # the context files), so the digest is the same whatever the builder's umask.
+# The Dockerfile's first line pins the Dockerfile frontend by digest, so
+# that frontend, not the one built into the host's Docker, writes the image
+# config. The host's BuildKit still builds the layers. The build pulls the
+# frontend from Docker Hub (network) unless Docker has it already, and stops
+# if the Dockerfile it builds lacks the pin (need_frontend_pin in
+# scripts/common.sh).
 set -euo pipefail
 # shellcheck source=common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -75,6 +81,8 @@ for notice in "$CTX/licenses/"*; do
   extra+=("licenses/${notice##*/}|$notice|-rw-r--r--")
 done
 devnet_hook azure_image_ctx "$CTX"
+# The Dockerfile we build, after the overlay's hook, pins the frontend.
+need_frontend_pin "$CTX/Dockerfile" || die "the Dockerfile of the build does not pin the Dockerfile frontend"
 
 build_once() { # build_once <n>: archive in $OUT/runner-<n>.oci.tar, prints the manifest digest
   SOURCE_DATE_EPOCH=0 docker buildx build -q --no-cache --provenance=false --sbom=false \

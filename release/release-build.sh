@@ -11,7 +11,9 @@
 #      Debian), the NTS crates (network: crates.io, Cargo.lock),
 #   3. scripts/generic-images.sh build with SIGNER_BUILDER_IMAGE set: the
 #      runners and parent tools in the builder, offline, then the three
-#      images, each built twice,
+#      images, each built twice. The GCP and Azure Dockerfiles pin their
+#      Dockerfile frontend by digest (network: Docker Hub,
+#      docker/dockerfile), so their digests do not follow the host's Docker,
 #   4. check that the GCP and Azure images are of IMAGE_VARIANT
 #      (release/image-variant.py),
 #   5. copy what a release ships into DIST, with DIST/SHA256SUMS. The names
@@ -48,8 +50,9 @@
 #   - az with the confcom extension at the version of AZ_CONFCOM_VERSION.
 #   - git, python3, jq, file, cc (build-essential), nm and readelf
 #     (binutils), and the aarch64 nm (binutils-aarch64-linux-gnu): the NTS
-#     step checks its archives with them on the host. scripts/deps.sh
-#     installs these.
+#     step checks its archives with them on the host. envsubst
+#     (gettext-base) for scripts/kms-policy.sh. scripts/deps.sh installs
+#     these.
 #   - A Go of any version on PATH (it only reads build info; the build uses
 #     the builder's).
 #   - unshare and ip (util-linux, iproute2), and unprivileged user
@@ -118,6 +121,7 @@ need git "apt-get install git"
 need docker "install Docker"
 need python3 "apt-get install python3"
 need jq "apt-get install jq"
+need envsubst "apt-get install gettext-base"
 need file "apt-get install file"
 need go "install a Go of any version and put it on PATH"
 need cc "apt-get install build-essential"

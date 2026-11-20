@@ -803,6 +803,17 @@ inputs would give two image digests and two CCE policy hashes. With it,
 builds under umask 022 and 077 give the same digest and the same policy
 hash.
 
+### The image config does not follow the host's Dockerfile frontend
+
+The Dockerfile's first line pins the Dockerfile frontend by version and
+digest (`# syntax=docker/dockerfile:VERSION@sha256:DIGEST`), so that
+frontend writes the image config. The host's BuildKit still builds the
+layers. Without the pin, the build uses the frontend built into the host's
+Docker, and the image config can change from one Docker version to the next
+(docker/dockerfile 1.29.0 changed how the image history writes `EXPOSE`).
+The build pulls the pinned frontend from Docker Hub unless Docker has it
+already. `build-image.sh` stops if the Dockerfile it builds lacks the pin.
+
 ### Azure steps
 
 In order. Each needs `CONFIRM=yes` and refuses without it. The costs are
