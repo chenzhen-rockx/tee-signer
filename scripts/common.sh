@@ -382,8 +382,8 @@ run_build_runner() {
 # Dockerfile frontend by version and digest
 # (# syntax=docker/dockerfile:X.Y.Z@sha256:DIGEST). Without that line the
 # frontend built into the host's Docker writes the image config. The image
-# builds (platform-*/deploy/build-image.sh) run it on the Dockerfile they
-# build, and release/release-test.sh tests it.
+# builds (platform-*/deploy/build-image.sh, scripts/nitro-eif.sh) run it on
+# the Dockerfile they build, and release/release-test.sh tests it.
 need_frontend_pin() {
   local first
   first="$(head -n 1 "$1")"

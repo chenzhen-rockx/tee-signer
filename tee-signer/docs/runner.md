@@ -642,10 +642,10 @@ the key-release policy.
 - `scripts/generic-images.sh build` builds all three and writes their
   measurements; `check` compares a build with a recorded list.
 
-The GCP and Azure Dockerfiles pin the Dockerfile frontend by digest on
-their first line, so that frontend, not the one built into the host's
-Docker, writes their image config. The host's BuildKit still builds the
-layers.
+The GCP, Azure and Nitro enclave Dockerfiles pin the Dockerfile frontend
+by digest on their first line, so that frontend, not the one built into
+the host's Docker, writes their image config. The host's BuildKit still
+builds the layers.
 
 A verifier recomputes the same measurements from the same commit and
 compares them with the setup's list and the key-release policy before it

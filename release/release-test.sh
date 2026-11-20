@@ -12,6 +12,7 @@
 #   compare       release/compare.sh
 #   frontend      the first line of the measured image Dockerfiles, and
 #                 need_frontend_pin (scripts/common.sh) in the image builds
+#                 and nitro-eif.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
@@ -471,14 +472,15 @@ t_compare() {
   if grep -q '^same' "$TMP/out"; then bad "compare: printed same for an empty folder"; fi
 }
 
-# The GCP and Azure image Dockerfiles name the Dockerfile frontend by
-# version and digest on their first line, and both name the same one.
+# The GCP, Azure and Nitro enclave image Dockerfiles name the Dockerfile
+# frontend by version and digest on their first line, and all three name
+# the same one.
 # Without that line the build uses the frontend built into the host's
 # Docker, and the image config, so the digest, follows the host's Docker
 # version (EXPOSE in the history changed with docker/dockerfile 1.29.0).
 t_frontend() {
   local f first want=""
-  for f in platform-gcp/deploy/Dockerfile platform-azure/deploy/Dockerfile; do
+  for f in platform-gcp/deploy/Dockerfile platform-azure/deploy/Dockerfile platform-aws/deploy/enclave/Dockerfile; do
     first="$(head -n 1 "$HERE/../$f")"
     if [[ ! "$first" =~ ^#\ syntax=docker/dockerfile:[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$ ]]; then
       bad "frontend: $f does not start with '# syntax=docker/dockerfile:VERSION@sha256:DIGEST': '$first'"
@@ -522,6 +524,17 @@ FROM scratch
       bad "frontend: platform-$s build-image.sh does not run need_frontend_pin on \$CTX/Dockerfile between the overlay hook and the build (lines: hook '$hook', check '$chk', build '$build')"
     fi
   done
+  # nitro-eif.sh has no overlay hook: it checks the Dockerfile after it
+  # copies it into the build context, before the first EIF build.
+  f="$HERE/../scripts/nitro-eif.sh"
+  hook="$(grep -n '^install -m 0644 "$ROOT/platform-aws/deploy/enclave/Dockerfile" "$CTX/Dockerfile"$' "$f" | cut -d: -f1 || true)"
+  chk="$(grep -n '^need_frontend_pin "$CTX/Dockerfile" || die ' "$f" | cut -d: -f1 || true)"
+  build="$(grep -n '^build_eif ""$' "$f" | cut -d: -f1 || true)"
+  if [ -n "$hook" ] && [ -n "$chk" ] && [ -n "$build" ] && [ "$hook" -lt "$chk" ] && [ "$chk" -lt "$build" ]; then
+    ok "frontend: nitro-eif.sh checks the pin after the copy into the context, before the build"
+  else
+    bad "frontend: nitro-eif.sh does not run need_frontend_pin on \$CTX/Dockerfile between the copy into the context and the build (lines: copy '$hook', check '$chk', build '$build')"
+  fi
 }
 # frontend_pin FILE: need_frontend_pin of scripts/common.sh on FILE.
 frontend_pin() {

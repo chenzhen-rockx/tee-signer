@@ -11,9 +11,10 @@
 #      Debian), the NTS crates (network: crates.io, Cargo.lock),
 #   3. scripts/generic-images.sh build with SIGNER_BUILDER_IMAGE set: the
 #      runners and parent tools in the builder, offline, then the three
-#      images, each built twice. The GCP and Azure Dockerfiles pin their
-#      Dockerfile frontend by digest (network: Docker Hub,
-#      docker/dockerfile), so their digests do not follow the host's Docker,
+#      images, each built twice. The GCP, Azure and Nitro enclave
+#      Dockerfiles pin their Dockerfile frontend by digest (network: Docker
+#      Hub, docker/dockerfile), so the image config does not follow the
+#      frontend built into the host's Docker,
 #   4. check that the GCP and Azure images are of IMAGE_VARIANT
 #      (release/image-variant.py),
 #   5. copy what a release ships into DIST, with DIST/SHA256SUMS. The names

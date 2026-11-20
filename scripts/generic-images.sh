@@ -49,9 +49,11 @@
 # Environment: for the policy, ACR_NAME and VAULT (any names: az confcom runs with --omit-id,
 # so the policy does not depend on them; default signeracr and
 # signer-vault). Go runs with GOPROXY=off and GOTOOLCHAIN=local, and the
-# EIF build uses the local nitro-cli image (NITRO_CLI_REUSE=1): nothing here
-# downloads. The pinned sources in third_party/ and the docker images
-# (nitro-cli, the NTS toolchain, and what the overlay needs) must be there.
+# EIF build uses the local nitro-cli image (NITRO_CLI_REUSE=1). The one
+# download is the pinned Dockerfile frontend of the three images, from
+# Docker Hub, unless Docker has it already. The pinned sources in
+# third_party/ and the docker images (nitro-cli, the NTS toolchain, and what
+# the overlay needs) must be there.
 set -euo pipefail
 # shellcheck source=common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"

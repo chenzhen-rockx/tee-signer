@@ -52,6 +52,13 @@
 # checked (no arm64 host here), and neither was a launch: the first launch
 # on Graviton is the check, with the PCRs of nitro-cli describe-enclaves.
 #
+# The Dockerfile's first line pins the Dockerfile frontend by digest, so
+# that frontend, not the one built into the host's Docker, writes the image
+# config. The host's BuildKit still builds the layers. The build pulls the
+# frontend from Docker Hub (network) unless Docker has it already, and stops
+# if the Dockerfile it builds lacks the pin (need_frontend_pin in
+# scripts/common.sh).
+#
 # The EIF is built twice from scratch to check that the PCRs repeat. Then
 # scripts/eif-check.sh reads the EIF itself: kernel header, the runner in
 # the ramdisk, and PCR0/1/2 recomputed without nitro-cli.
@@ -129,6 +136,8 @@ install -m 0555 "$RUNNER" "$CTX/runner"
 mkdir -m 0755 "$CTX/licenses"
 install -m 0644 "$RUNNER.licenses/"* "$CTX/licenses/"
 install -m 0644 "$ROOT/platform-aws/deploy/enclave/Dockerfile" "$CTX/Dockerfile"
+# The Dockerfile we build pins the frontend.
+need_frontend_pin "$CTX/Dockerfile" || die "the Dockerfile of the build does not pin the Dockerfile frontend"
 # Do not reset mtimes here: BuildKit skips re-sending context files whose
 # size and mtime look unchanged, which once put a stale runner in the
 # image. rewrite-timestamp below clamps layer timestamps instead.

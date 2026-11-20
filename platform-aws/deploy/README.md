@@ -548,6 +548,17 @@ take the modes of the context files, and PCR0 and PCR2 would follow the
 builder's umask. With them, an EIF built under umask 022 and one under 077
 have the same PCR0, PCR1 and PCR2.
 
+The first line of `enclave/Dockerfile` pins the Dockerfile frontend by
+version and digest (`# syntax=docker/dockerfile:VERSION@sha256:DIGEST`), as
+in the GCP and Azure Dockerfiles. That frontend writes the image config.
+The host's BuildKit still builds the layers. Without the pin, the build uses
+the frontend built into the host's Docker, and the image config can change
+from one Docker version to the next. The build pulls the pinned frontend
+from Docker Hub unless Docker has it already. `scripts/nitro-eif.sh` stops
+if the Dockerfile it builds lacks the pin. The EIF takes the files, the
+command and the environment of the image, not its history. Adding the pin
+left PCR0, PCR1 and PCR2 the same (hoodi build, Docker 29.9.3).
+
 The KMS key policy takes these PCRs. `scripts/kms-policy.sh` renders it from
 the build, so a new image means a new rendered policy and a new key policy on
 the KMS key (or `prev_pcrs` during a rollover).
