@@ -43,7 +43,16 @@ var rootSHA256 = map[string]string{
 	"sslcom-root-ecc.pem": "3417bb06cc6007da1b961c920b8ab4ce3fad820e4aa30b9acbc4a74ebdcebc65",
 	"isrg-root-x1.pem":    "96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6",
 	"isrg-root-x2.pem":    "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470",
+	"gts-root-r4.pem":     "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d",
 }
+
+// CoarseRoots are the roots of the coarse HTTPS-Date host www.cloudflare.com,
+// which is a web site, not an NTS server: in November 2026 it serves
+// leaf <- Google Trust Services WE1 <- GTS Root R4 (cross-signed by
+// GlobalSign Root CA), while time.cloudflare.com still serves the SSL.com
+// chain above. The coarse client adds this set next to the cloud roots; the
+// NTS-KE pool of time.cloudflare.com stays SSL.com only.
+var CoarseRoots = []string{"gts-root-r4.pem"}
 
 // Server is a public NTS server and who runs it.
 type Server struct {

@@ -189,6 +189,12 @@ func coarseClient(c *http.Client) (*http.Client, error) {
 			return nil, err
 		}
 	}
+	// The coarse host www.cloudflare.com is not an NTS server: it serves a
+	// Google Trust Services chain (GTS Root R4) while time.cloudflare.com
+	// still serves SSL.com, so its root needs its own set (nts.CoarseRoots).
+	if err := nts.AddRoots(pool, nts.CoarseRoots); err != nil {
+		return nil, err
+	}
 	t.TLSClientConfig.RootCAs = pool
 	cc := *c
 	cc.Transport = t

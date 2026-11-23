@@ -10,3 +10,5 @@
 # OS generated files
 .DS_Store
 Thumbs.db
+# local terraform deployment config (contains account-specific values)
+platform-aws/deploy/terraform.tfvars
