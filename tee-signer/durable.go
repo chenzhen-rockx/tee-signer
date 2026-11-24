@@ -71,7 +71,10 @@ func (d *durableCopy) open(ctx context.Context, p *platform.Platform) (platform.
 	if err := checkStoreProject(ctx, l, d.projectNumber, "-state-store"); err != nil {
 		return nil, err
 	}
-	opt := statestore.Options{SetupHash: d.setupHash, AllowCreate: d.create, Log: d.log}
+	// A commit skips a name taken by an object that is not a commit only
+	// if the object is locked as long as a commit: the copy's retention
+	// is its own (retainDays) or the store's checked lock (lockDays).
+	opt := statestore.Options{SetupHash: d.setupHash, AllowCreate: d.create, RetainDays: max(d.retainDays, d.lockDays), Log: d.log}
 	if d.setupHash != ([32]byte{}) {
 		// The copy ages on the clock the mark log ages on. The NTS clock
 		// replaces p.Clock after open returns, so read it at each call.

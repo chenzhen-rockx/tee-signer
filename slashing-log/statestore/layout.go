@@ -292,12 +292,13 @@ func (s *Store) createCommit(ctx context.Context, plain []byte) (uint64, []byte,
 		err = s.log.Create(ctx, name, obj)
 		if errors.Is(err, markstore.ErrExists) {
 			var found []*object
+			var mine []markstore.Entry
 			gerr := readBack(ctx, func(ctx context.Context) error {
 				es, err := s.log.List(ctx, name)
 				if err != nil {
 					return err
 				}
-				var mine []markstore.Entry
+				mine = nil
 				for _, e := range es {
 					if e.Name == name {
 						mine = append(mine, e)
@@ -310,7 +311,17 @@ func (s *Store) createCommit(ctx context.Context, plain []byte) (uint64, []byte,
 				return 0, nil, fmt.Errorf("statestore: version %d exists and cannot be read back: %w", v, gerr)
 			}
 			if len(found) == 0 {
-				s.opt.Log.Warn("state copy: name taken by an object that is not a commit; skipping it", "version", v)
+				// Skip the name only if nobody can delete the object before
+				// a commit there could go (markstore.CheckKept); a clone
+				// that skipped a deletable object would commit beside this
+				// process once it is gone. Otherwise stop, without a latch.
+				keep := time.Duration(s.opt.RetainDays) * 24 * time.Hour
+				if kerr := markstore.CheckKept(ctx, s.log, mine, s.stamp, keep); kerr != nil {
+					s.opt.Log.Error("state copy: name taken by an object that is not a commit and that is not locked as long as a commit; "+
+						"no commits are written until it is gone", "version", v, "err", kerr)
+					return 0, nil, fmt.Errorf("statestore: version %d: %w", v, kerr)
+				}
+				s.opt.Log.Warn("state copy: name taken by a locked object that is not a commit; skipping it", "version", v)
 				continue
 			}
 			// Our own write whose reply was lost, unless another commit

@@ -111,8 +111,11 @@ the newest commits there and the restore would take an older one. It
 checks before and again after the read, so a store that changes in
 between stops the start too. A commit name taken by a
 valid commit of another process means a clone: that process changes no
-durable state from then on (`ErrLost`). Objects that are not commits cost
-a skip each, as in the mark log.
+durable state from then on (`ErrLost`). An object that is not a commit
+costs a skip only if it is locked as long as a commit; any other stops
+the commit until it is gone, as in the mark log (`marklog.md`, objects
+under future names). A listed commit that reads as not found stops the
+start.
 
 ### All or nothing
 
