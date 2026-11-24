@@ -103,6 +103,26 @@ make_yaml "$T/c6.yaml" '.PRESET_BASE = "minimal"'
 expect_fail "check-source: the minimal preset" bash "$CHAIN" check-source hoodi "$T/c6.yaml" "$T/gvr.txt"
 echo "0x$(printf '00%.0s' {1..32})" >"$T/gvr-bad.txt"
 expect_fail "check-source: another genesis validators root" bash "$CHAIN" check-source hoodi "$T/config.yaml" "$T/gvr-bad.txt"
+# With a genesis_validators_root.txt, check-source adds MIN_GENESIS_TIME and
+# GENESIS_DELAY of config.yaml. Each must be a plain decimal integer, checked
+# before any arithmetic: anything else is refused by name and runs nothing.
+# The check would fail on the genesis_time DIFF line anyway, so the marker
+# file and the refusal line are what tell.
+for key in MIN_GENESIS_TIME GENESIS_DELAY; do
+  for v in "bad[\$(touch\${IFS}$T/ran-$key)]" FAR_FUTURE 0600 -1 ''; do
+    rm -f "$T/ran-$key"
+    make_yaml "$T/c-$key.yaml" ".$key = \"$v\""
+    if bash "$CHAIN" check-source hoodi "$T/c-$key.yaml" "$T/gvr.txt" >"$T/out" 2>&1; then
+      bad "check-source: $key $v passes"
+    elif [ -e "$T/ran-$key" ]; then
+      bad "check-source: $key $v of config.yaml ran a command"
+    elif grep -q "$key .*not a plain decimal integer" "$T/out"; then
+      ok "check-source: refuses $key '$v'"
+    else
+      bad "check-source: $key '$v' is not refused by name"; sed 's/^/      /' "$T/out"
+    fi
+  done
+done
 
 # ---- check-beacon: a beacon API made of files, read through file:// ----
 make_beacon() { # make_beacon DIR [jq filter on the fork schedule]

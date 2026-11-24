@@ -198,7 +198,15 @@ cmd_check_source() {
       got="$(od -An -v -tu8 -N 8 --endian=little "$gvrfile" | tr -d '[:space:]')"
       if [ "$got" = "$want" ]; then echo "ok    genesis_time $want (genesis state)"; else echo "DIFF  genesis_time: source file $want, genesis state $got"; bad=1; fi ;;
     *)
-      got=$(( ${up[MIN_GENESIS_TIME]:-0} + ${up[GENESIS_DELAY]:-0} ))
+      # Both values come from config.yaml, a file from outside the repo:
+      # each must be a plain decimal integer (no sign, no leading zero, at
+      # most 18 digits) before it goes into $(( )), which would otherwise
+      # evaluate names, array subscripts and octal.
+      for key in MIN_GENESIS_TIME GENESIS_DELAY; do
+        [[ "${up[$key]:-}" =~ ^(0|[1-9][0-9]{0,17})$ ]] ||
+          die "$yaml: $key ${up[$key]:-<missing>} is not a plain decimal integer"
+      done
+      got=$(( ${up[MIN_GENESIS_TIME]} + ${up[GENESIS_DELAY]} ))
       if [ "$got" = "$want" ]; then echo "ok    genesis_time $want = MIN_GENESIS_TIME + GENESIS_DELAY"; else echo "DIFF  genesis_time: source file $want, MIN_GENESIS_TIME + GENESIS_DELAY $got"; bad=1; fi ;;
   esac
   local tmp
