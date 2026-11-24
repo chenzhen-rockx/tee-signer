@@ -52,8 +52,8 @@
 # checked (no arm64 host here), and neither was a launch: the first launch
 # on Graviton is the check, with the PCRs of nitro-cli describe-enclaves.
 #
-# The pinned BuildKit (BUILDKIT_IMAGE in scripts/common.sh, run by the
-# buildx builder BUILDKIT_BUILDER) and the pinned Dockerfile frontend (the
+# The pinned BuildKit (BUILDKIT_IMAGE in scripts/common.sh, run by a
+# buildx builder made for the run) and the pinned Dockerfile frontend (the
 # Dockerfile's first line) build the image: the layers and the image
 # config. The host's Docker only runs the BuildKit container. The first
 # build on a host pulls both images from Docker Hub (network). The build
@@ -62,6 +62,11 @@
 # images to itself, so the build writes a docker archive, docker load puts
 # it into the host's Docker, and the script checks that the loaded image is
 # the one built. nitro-cli reads it from the host's Docker as before.
+#
+# pinned_builder makes a new builder for each run (docker-container
+# driver, one node, started with --bootstrap), and the script removes it
+# when it ends, also on failure. Run from generic-images.sh or
+# release-build.sh, it builds on their builder (BUILDKIT_BUILDER).
 #
 # The EIF is built twice from scratch to check that the PCRs repeat. Then
 # scripts/eif-check.sh reads the EIF itself: kernel header, the runner in
@@ -142,8 +147,11 @@ install -m 0644 "$RUNNER.licenses/"* "$CTX/licenses/"
 install -m 0644 "$ROOT/platform-aws/deploy/enclave/Dockerfile" "$CTX/Dockerfile"
 # The Dockerfile we build pins the frontend.
 need_frontend_pin "$CTX/Dockerfile" || die "the Dockerfile of the build does not pin the Dockerfile frontend"
-# The pinned BuildKit builds the image (pinned_builder in scripts/common.sh).
-pinned_builder || die "the builder $BUILDKIT_BUILDER does not run the pinned BuildKit $BUILDKIT_IMAGE"
+# The pinned BuildKit builds the image, on a builder made for this run or
+# on the calling run's (pinned_builder in scripts/common.sh). drop_builder
+# removes a builder made here when the script ends.
+trap drop_builder EXIT
+pinned_builder || die "no builder that runs the pinned BuildKit $BUILDKIT_IMAGE"
 # Do not reset mtimes here: BuildKit skips re-sending context files whose
 # size and mtime look unchanged, which once put a stale runner in the
 # image. rewrite-timestamp below clamps layer timestamps instead.

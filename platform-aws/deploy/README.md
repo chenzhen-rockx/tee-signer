@@ -551,8 +551,9 @@ have the same PCR0, PCR1 and PCR2.
 A pinned BuildKit and a pinned Dockerfile frontend build the enclave image,
 as for the GCP and Azure images. `scripts/common.sh` names the BuildKit
 image by version and index digest (`BUILDKIT_IMAGE`).
-`scripts/nitro-eif.sh` builds on the buildx builder `BUILDKIT_BUILDER`
-(docker-container driver), which runs that image. The first line of
+`scripts/nitro-eif.sh` makes a new buildx builder for each run
+(docker-container driver, one node) that runs that image, builds on it,
+and removes it at the end (`pinned_builder` in `scripts/common.sh`). The first line of
 `enclave/Dockerfile` pins the frontend
 (`# syntax=docker/dockerfile:VERSION@sha256:DIGEST`). These two build the
 layers and write the image config. The host's Docker only runs the

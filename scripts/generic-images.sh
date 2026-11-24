@@ -53,8 +53,10 @@
 # EIF build uses the local nitro-cli image (NITRO_CLI_REUSE=1). The pinned
 # BuildKit (BUILDKIT_IMAGE in scripts/common.sh) and the pinned Dockerfile
 # frontend build the three images; the host's Docker only runs the BuildKit
-# container. These two images, from Docker Hub, are the only downloads
-# here. The pinned sources in
+# container. build makes one buildx builder for the three images and
+# removes it at its end; under release-build.sh it uses the lane's. These
+# two images, from Docker Hub, are the only downloads here. The pinned
+# sources in
 # third_party/ and the docker images (nitro-cli, the NTS toolchain, and what
 # the overlay needs) must be there.
 set -euo pipefail
@@ -111,6 +113,11 @@ cmd_build() {
   local dir="${1:-$BUILD/generic$SUFFIX}" start
   start=$(date +%s)
   mkdir -p "$dir"
+  # One builder of the pinned BuildKit for the three image builds, which
+  # find it in BUILDKIT_BUILDER (the calling lane's, if it has one).
+  # drop_builder removes a builder made here when the script ends.
+  trap drop_builder EXIT
+  pinned_builder || die "no builder that runs the pinned BuildKit $BUILDKIT_IMAGE"
   log "Nitro EIF, arm64 (log $dir/nitro.log)"
   bash "$ROOT/scripts/nitro-eif.sh" aarch64 >"$dir/nitro.log" 2>&1 || { tail -n 30 "$dir/nitro.log"; die "nitro-eif.sh failed"; }
   local p

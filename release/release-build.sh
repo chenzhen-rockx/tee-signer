@@ -12,7 +12,7 @@
 #   3. scripts/generic-images.sh build with SIGNER_BUILDER_IMAGE set: the
 #      runners and parent tools in the builder, offline, then the three
 #      images, each built twice. A pinned BuildKit (BUILDKIT_IMAGE in
-#      scripts/common.sh, in its own buildx builder) and the pinned
+#      scripts/common.sh, in the lane's buildx builder) and the pinned
 #      Dockerfile frontend of each Dockerfile build the three images
 #      (network on the first build: Docker Hub, moby/buildkit and
 #      docker/dockerfile). The host's Docker only runs the BuildKit
@@ -55,12 +55,17 @@
 #     aarch64 cross gcc; the arm64 outputs (runner-aws, the EIF, the parent
 #     tools) are cross-built on it.
 #   - Docker with the containerd image store and buildx.
-#   - The pinned BuildKit. The lane starts a privileged BuildKit container
-#     (BUILDKIT_IMAGE in scripts/common.sh, the buildx builder
-#     signer-buildkit) with network access, and checks that it runs before
-#     the first build. The first lane on a host pulls it from Docker Hub.
-#     The container stays after the build; remove it with
-#     docker buildx rm signer-buildkit.
+#   - The pinned BuildKit. The lane makes its own buildx builder
+#     (docker-container driver, one node),
+#     signer-buildkit-<UTC time>-b<boot>-p<pid>, whose privileged
+#     container runs BUILDKIT_IMAGE (scripts/common.sh) with network
+#     access. It checks that the builder starts before the first build,
+#     and removes it when the lane ends, also on failure. At its start it
+#     removes the signer-buildkit-* builders of this boot whose run is
+#     gone, and keeps those of live runs and of other boots. It does not
+#     touch signer-buildkit, the one builder of earlier versions of the
+#     scripts; docker buildx rm signer-buildkit removes it. The first lane
+#     on a host pulls the BuildKit image from Docker Hub.
 #   - qemu-user-static (binfmt_misc entry qemu-aarch64 with the F flag) for
 #     the arm64 linuxkit of the EIF build. Docker Desktop has its own.
 #   - az with the confcom extension at the version of AZ_CONFCOM_VERSION.
@@ -168,8 +173,11 @@ if [ ${#missing[@]} -gt 0 ]; then
 fi
 # The pinned BuildKit builds the three images (step 3). Start it now, so a
 # host that cannot pull or run it stops here and not after the long steps.
+# This is the lane's builder: the image builds of step 3 use it
+# (BUILDKIT_BUILDER), and drop_builder removes it when the lane ends.
+trap drop_builder EXIT
 pinned_builder ||
-  die "the builder $BUILDKIT_BUILDER does not run the pinned BuildKit $BUILDKIT_IMAGE: Docker must pull it from Docker Hub and run it as a privileged container (docker buildx rm $BUILDKIT_BUILDER removes a broken builder)"
+  die "the builder $BUILDKIT_BUILDER does not run the pinned BuildKit $BUILDKIT_IMAGE: Docker must pull it from Docker Hub and run it as a privileged container"
 
 # The time stamp of the licence archives and SBOMs: the commit time of HEAD,
 # or SOURCE_DATE_EPOCH when set (the tagged commit's time, when the release

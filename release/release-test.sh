@@ -14,8 +14,8 @@
 #                 need_frontend_pin (scripts/common.sh) in the image builds
 #                 and nitro-eif.sh
 #   buildkit      the pinned BuildKit (BUILDKIT_IMAGE in scripts/common.sh),
-#                 pinned_builder, and --builder on every build of the
-#                 measured images
+#                 pinned_builder and drop_builder, and --builder on
+#                 every build of the measured images
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
@@ -165,10 +165,35 @@ case "$1 $2" in
   "image inspect") echo "$FAKE_ID" ;;
   "buildx build") ;;
   "buildx version") echo "github.com/docker/buildx v0.30.0" ;;
-  # pinned_builder: the builder exists and runs FAKE_BK_REF, unless
-  # FAKE_BK_FAIL is set, when it is missing and cannot be created.
-  "buildx inspect" | "buildx create") [ -z "$FAKE_BK_FAIL" ] || exit 1 ;;
-  "container inspect") echo "$FAKE_BK_REF $FAKE_ID" ;;
+  # pinned_builder: buildx create makes the builder whose name the file
+  # FAKE_BK_STATE holds (empty: no builder), on FAKE_BK_REF. FAKE_BK_FAIL:
+  # no builder can be made. FAKE_BK_BOOT_FAIL: no builder starts, every
+  # --bootstrap fails (a create makes the builder first). buildx ls also
+  # lists signer-buildkit, a builder of an earlier version of the
+  # scripts, with its node.
+  "buildx ls")
+    printf 'signer-buildkit\nsigner-buildkit0\n'
+    [ ! -s "$FAKE_BK_STATE" ] || { n="$(cat "$FAKE_BK_STATE")"; printf '%s\n%s0\n' "$n" "$n"; } ;;
+  "buildx inspect")
+    case "$*" in *--bootstrap*) [ -z "$FAKE_BK_BOOT_FAIL" ] || exit 1 ;; esac
+    [ -z "$FAKE_BK_FAIL" ] || exit 1
+    for a; do n="$a"; done
+    if [ "$n" = signer-buildkit ] || { [ -s "$FAKE_BK_STATE" ] && [ "$n" = "$(cat "$FAKE_BK_STATE")" ]; }; then
+      printf 'Name: %s\nDriver: docker-container\n\nNodes:\nName: %s0\nStatus: running\n' "$n" "$n"
+    else
+      exit 1
+    fi ;;
+  "buildx create")
+    [ -z "$FAKE_BK_FAIL" ] || exit 1
+    prev=""
+    for a; do [ "$prev" != --name ] || echo "$a" >"$FAKE_BK_STATE"; prev="$a"; done
+    case "$*" in *--bootstrap*) [ -z "$FAKE_BK_BOOT_FAIL" ] || exit 1 ;; esac ;;
+  "buildx rm")
+    for a; do n="$a"; done
+    [ -s "$FAKE_BK_STATE" ] && [ "$n" = "$(cat "$FAKE_BK_STATE")" ] || exit 1
+    : >"$FAKE_BK_STATE" ;;
+  "container inspect")
+    case "$*" in *State.Running*) echo "$FAKE_BK_REF $FAKE_ID true" ;; *) echo "$FAKE_BK_REF $FAKE_ID" ;; esac ;;
   "info "*) echo "$FAKE_DRIVER_STATUS" ;;
   "run "*)
     [ -n "$FAKE_RUN_OK" ] || exit 97
@@ -301,11 +326,12 @@ EOF
     local name="$1" want="$2" rc=0 ran=no p
     shift 2
     : >"$TMP/docker.log"
+    : >"$TMP/lane-bk"
     rm -rf "$d/dist"
     for p in $hide; do mv "$hostbin/$p" "$TMP/hidden/"; done
     (cd "${cwd:-$d/repo}" && env -u SIGNER_BUILDER_IMAGE -u DVT DOCKER_LOG="$TMP/docker.log" FAKE_ID="$id" \
       FAKE_DRIVER_STATUS='[["driver-type","io.containerd.snapshotter.v1"]]' FAKE_UNSHARE_FAIL= FAKE_UNAME=x86_64 \
-      FAKE_RUN_OK= FAKE_SBOM_EMPTY= FAKE_BK_REF="$bk_ref" FAKE_BK_FAIL= PATH="$hostbin" "$@" \
+      FAKE_RUN_OK= FAKE_SBOM_EMPTY= FAKE_BK_REF="$bk_ref" FAKE_BK_FAIL= FAKE_BK_BOOT_FAIL= FAKE_BK_STATE="$TMP/lane-bk" PATH="$hostbin" "$@" \
       bash "$d/repo/release/release-build.sh" "${dist:-$d/dist}") >"$TMP/out" 2>&1 || rc=$?
     for p in $hide; do mv "$TMP/hidden/$p" "$hostbin/"; done
     hide="" cwd="" dist=""
@@ -317,6 +343,16 @@ EOF
       ok "$name"
     else
       bad "$name (exit $rc, docker run: $ran): $(tail -n 2 "$TMP/out")"
+    fi
+  }
+  # dropped NAME: the last lane made one builder and removed it.
+  dropped() {
+    local n
+    n="$(sed -n 's/^buildx create --name \([^ ]*\) .*/\1/p' "$TMP/docker.log")"
+    if [ -n "$n" ] && [ "$(printf '%s\n' "$n" | wc -l)" = 1 ] && grep -qxF "buildx rm $n" "$TMP/docker.log" && [ ! -s "$TMP/lane-bk" ]; then
+      ok "$1"
+    else
+      bad "$1: $(grep '^buildx' "$TMP/docker.log" | tr '\n' ';')"
     fi
   }
 
@@ -364,6 +400,17 @@ EOF
   lane "release-build: refuses a host where the pinned BuildKit builder fails" stop FAKE_BK_FAIL=1
   says "release-build: names the pinned BuildKit builder" "signer-buildkit.*moby/buildkit"
   if grep -q '^buildx build' "$TMP/docker.log"; then bad "release-build: built the builder image before the BuildKit check"; else ok "release-build: no build before the BuildKit check"; fi
+  # A builder that is made but does not start stops the lane too, and the
+  # lane removes it. The builder signer-buildkit of an earlier version of
+  # the scripts is not the lane's: it stays.
+  repo
+  lane "release-build: stops when the pinned BuildKit builder does not start" stop FAKE_BK_BOOT_FAIL=1
+  if grep -q '^buildx build' "$TMP/docker.log"; then bad "release-build: built after a builder that does not start"; else ok "release-build: no build after a builder that does not start"; fi
+  dropped "release-build: removes the builder that does not start"
+  if grep -q '^buildx rm signer-buildkit$' "$TMP/docker.log"; then bad "release-build: removed the builder signer-buildkit of an earlier version"; else ok "release-build: leaves the builder signer-buildkit of an earlier version"; fi
+  repo
+  lane "release-build: a lane that fails after the BuildKit check" run
+  dropped "release-build: removes its builder when it fails"
   repo
   lane "release-build: refuses a mainnet test lane" stop CHAIN=mainnet IMAGE_VARIANT=test
   says "release-build: says mainnet builds are prod only" "mainnet builds are prod only"
@@ -396,6 +443,7 @@ EOF
   [ -s "$d/old-dist/SHA256SUMS" ] || bad "release-build: removed the earlier output in DIST"
   repo full
   lane "release-build: a full lane with stubs gets to its end" end FAKE_RUN_OK=1
+  dropped "release-build: removes its builder at its end"
   if [ "$(grep -c '\.spdx\.json$' "$d/dist/SHA256SUMS" 2>/dev/null)" = 8 ]; then ok "release-build: DIST lists 8 SBOMs"; else bad "release-build: DIST lists 8 SBOMs: $(tail -n 2 "$TMP/out")"; fi
   repo full
   rm -rf "$d/empty-dist" && mkdir -p "$d/empty-dist"
@@ -558,8 +606,8 @@ frontend_pin() {
 }
 
 # The measured images build on one BuildKit, pinned by digest in one
-# place (BUILDKIT_IMAGE in scripts/common.sh), in the buildx builder
-# BUILDKIT_BUILDER. Without it the host's BuildKit builds and compresses
+# place (BUILDKIT_IMAGE in scripts/common.sh), in a buildx builder made
+# for each run (BUILDKIT_BUILDER). Without it the host's BuildKit builds and compresses
 # the layers and writes the image config, so the digests follow the host's
 # Docker.
 t_buildkit() {
@@ -572,20 +620,9 @@ t_buildkit() {
     bad "buildkit: scripts/common.sh has no single BUILDKIT_IMAGE=\"moby/buildkit:vX.Y.Z@sha256:DIGEST\" line: '$line'"
   fi
   ref="${line#BUILDKIT_IMAGE=\"}" ref="${ref%\"}" digest="${ref##*@sha256:}"
-  # The digest is in one file only: every user reads BUILDKIT_IMAGE. In a
-  # git checkout git grep reads the tracked files. A tree without git, such
-  # as a git archive copy, gets a grep over all its files.
-  local root
-  root="$(cd "$HERE/.." && pwd -P)"
+  # The digest is in one file only: every user reads BUILDKIT_IMAGE.
   files=""
-  if [ -z "$line" ]; then
-    :
-  elif command -v git >/dev/null 2>&1 &&
-    [ "$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" = "$root" ]; then
-    files="$(git -C "$root" grep -l -F -- "$digest" | LC_ALL=C sort | tr '\n' ' ' || true)"
-  else
-    files="$(cd "$root" && grep -rlF --exclude-dir=.git -- "$digest" . | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ' || true)"
-  fi
+  [ -z "$line" ] || files="$(digest_files "$(cd "$HERE/.." && pwd -P)" "$digest")"
   if [ -z "$line" ]; then
     bad "buildkit: no BuildKit digest to look for"
   elif [ "$files" = "scripts/common.sh " ]; then
@@ -593,10 +630,35 @@ t_buildkit() {
   else
     bad "buildkit: the BuildKit digest is in '$files', want scripts/common.sh only"
   fi
-  if [[ "$(grep -E '^BUILDKIT_BUILDER=' "$common" || true)" =~ ^BUILDKIT_BUILDER=[a-z0-9-]+$ ]]; then
-    ok "buildkit: scripts/common.sh names the builder (BUILDKIT_BUILDER)"
+  # Build logs hold the BuildKit reference (pinned_builder logs it). The
+  # check skips the generated folders, in a git checkout and in a copy
+  # without git.
+  local gen sub
+  for sub in nogit git; do
+    gen="$(mktemp -d "$TMP/digest-$sub.XXXXXX")"
+    mkdir -p "$gen/scripts" "$gen/logs" "$gen/build/x" "$gen/signer-core/build"
+    cp "$HERE/../.gitignore" "$gen/"
+    echo "BUILDKIT_IMAGE=\"$ref\"" >"$gen/scripts/common.sh"
+    echo "creating the builder on $ref" >"$gen/logs/build.log"
+    echo "$ref" >"$gen/build/x/gcp.log"
+    echo "$ref" >"$gen/signer-core/build/y"
+    if [ "$sub" = git ]; then
+      git -C "$gen" init -q
+      git -C "$gen" add -A
+      git -C "$gen" add -f logs/build.log
+      git -C "$gen" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m t
+    fi
+    files="$(digest_files "$(cd "$gen" && pwd -P)" "$digest")"
+    if [ "$files" = "scripts/common.sh " ]; then
+      ok "buildkit: the digest check skips build/ and logs/ ($sub)"
+    else
+      bad "buildkit: the digest check skips build/ and logs/ ($sub): '$files'"
+    fi
+  done
+  if [ "$(grep -E '^BUILDKIT_PREFIX=' "$common" || true)" = BUILDKIT_PREFIX=signer-buildkit ]; then
+    ok "buildkit: scripts/common.sh names the builders signer-buildkit-* (BUILDKIT_PREFIX)"
   else
-    bad "buildkit: scripts/common.sh has no fixed BUILDKIT_BUILDER name"
+    bad "buildkit: scripts/common.sh has no BUILDKIT_PREFIX=signer-buildkit"
   fi
 
   # Every image build of the three scripts names the builder, after
@@ -621,57 +683,180 @@ t_buildkit() {
       ok "buildkit: $rel builds on the pinned builder only"
     fi
   done
+  # Every script that calls pinned_builder removes its builder on exit:
+  # it sets an EXIT trap with drop_builder before the call, and every
+  # later EXIT trap keeps drop_builder.
+  local traps
+  for rel in platform-gcp/deploy/build-image.sh platform-azure/deploy/build-image.sh scripts/nitro-eif.sh scripts/generic-images.sh release/release-build.sh; do
+    f="$HERE/../$rel"
+    chk="$(grep -nE '^ *pinned_builder( |$)' "$f" | head -n 1 | cut -d: -f1 || true)"
+    traps="$(grep -nE '^ *trap .* EXIT$' "$f" || true)"
+    first="$(printf '%s\n' "$traps" | grep -F drop_builder | head -n 1 | cut -d: -f1 || true)"
+    if [ -z "$chk" ]; then
+      bad "buildkit: $rel does not call pinned_builder"
+    elif [ -z "$first" ] || [ "$first" -gt "$chk" ]; then
+      bad "buildkit: $rel sets no EXIT trap with drop_builder before pinned_builder (trap '$first', call '$chk')"
+    elif printf '%s\n' "$traps" | grep -vF drop_builder | grep -q .; then
+      bad "buildkit: $rel has an EXIT trap without drop_builder: $(printf '%s\n' "$traps" | grep -vF drop_builder)"
+    else
+      ok "buildkit: $rel removes its builder on exit"
+    fi
+  done
 
-  # pinned_builder with a docker stub. The stub keeps the image of the
-  # builder's container in a file, and logs every create and rm.
+  # pinned_builder with a docker stub. The stub keeps each builder as a
+  # file in BK_DIR with "DRIVER NODES IMAGE STATUS" (an empty file: no
+  # builder), and logs every create and rm in BK_LOG. buildx create makes
+  # a docker-container builder with BK_CREATE_NODES nodes (default 1) on
+  # the image it names, or on BK_CREATE_IMAGE. With BK_CREATE_FAIL it
+  # makes the builder but its start fails, as in a create --bootstrap.
   local d="$TMP/buildkit" stub="$TMP/buildkit-bin"
   mkdir -p "$d" "$stub"
   cat >"$stub/docker" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env bash
 case "$1 $2" in
-  "buildx inspect") [ -f "$BK_STATE" ] || exit 1 ;;
+  "buildx ls")
+    for f in "$BK_DIR"/*; do
+      [ -s "$f" ] || continue
+      read -r _ nodes _ _ <"$f"
+      echo "${f##*/}"
+      for ((i = 0; i < nodes; i++)); do echo "${f##*/}$i"; done
+    done ;;
+  "buildx inspect")
+    n="${!#}"
+    [ -s "$BK_DIR/$n" ] || exit 1
+    read -r drv nodes _ status <"$BK_DIR/$n"
+    printf 'Name: %s\nDriver: %s\nLast Activity: now\n\nNodes:\n' "$n" "$drv"
+    for ((i = 0; i < nodes; i++)); do printf 'Name: %s%s\nEndpoint: unix:///var/run/docker.sock\nStatus: %s\n\n' "$n" "$i" "$status"; done ;;
   "buildx create")
     echo "$*" >>"$BK_LOG"
-    img=""
-    for a in "$@"; do case "$a" in image=*) img="${a#image=}" ;; esac; done
-    if [ -n "$BK_CREATE_IMAGE" ]; then echo "$BK_CREATE_IMAGE" >"$BK_STATE"; else echo "$img" >"$BK_STATE"; fi ;;
-  "buildx rm") echo "$*" >>"$BK_LOG"; rm -f "$BK_STATE" ;;
+    name="" img="" prev=""
+    for a in "$@"; do
+      [ "$prev" != --name ] || name="$a"
+      case "$a" in image=*) img="${a#image=}" ;; esac
+      prev="$a"
+    done
+    status=running
+    [ -z "$BK_CREATE_FAIL" ] || status=stopped
+    echo "docker-container ${BK_CREATE_NODES:-1} ${BK_CREATE_IMAGE:-$img} $status" >"$BK_DIR/$name"
+    [ -z "$BK_CREATE_FAIL" ] || exit 1 ;;
+  "buildx rm")
+    echo "$*" >>"$BK_LOG"
+    [ -s "$BK_DIR/${!#}" ] || exit 1
+    : >"$BK_DIR/${!#}" ;;
   "container inspect")
-    [ -f "$BK_STATE" ] || exit 1
-    echo "$(cat "$BK_STATE") sha256:id-of-$(cat "$BK_STATE")" ;;
-  "image inspect") echo "sha256:id-of-$(eval echo "\${$#}")" ;;
+    n="${!#}" n="${n#buildx_buildkit_}" n="${n%?}"
+    [ -s "$BK_DIR/$n" ] || exit 1
+    read -r _ _ img status <"$BK_DIR/$n"
+    run=false
+    [ "$status" != running ] || run=true
+    case "$*" in
+      *State.Running*) echo "$img sha256:id-of-$img $run" ;;
+      *) echo "$img sha256:id-of-$img" ;;
+    esac ;;
+  "image inspect") echo "sha256:id-of-${!#}" ;;
   *) exit 97 ;;
 esac
 EOF
   chmod +x "$stub/docker"
-  local st="$d/state" lg="$d/log"
-  : >"$lg"
-  rm -f "$st"
-  expect "buildkit: pinned_builder creates a missing builder" 0 pinned BK_STATE="$st" BK_LOG="$lg"
-  if grep -qF -- "buildx create --name signer-buildkit --driver docker-container --driver-opt image=$ref" "$lg"; then
-    ok "buildkit: the new builder runs BUILDKIT_IMAGE"
+  local bk lg="$d/log" boot name dead n
+  boot="$(bash -c '. "$1/scripts/common.sh" && boot_tag' _ "$HERE/.." 2>/dev/null || true)"
+  # fresh: a new empty builder folder bk and an empty log.
+  fresh() { bk="$(mktemp -d "$d/builders.XXXXXX")" && : >"$lg"; }
+  # gone NAME: no builder is left.
+  gone() {
+    local left
+    left="$(find "$bk" -type f -size +0 -printf '%f ')"
+    if [ -z "$left" ]; then ok "$1"; else bad "$1: left $left"; fi
+  }
+
+  fresh
+  expect "buildkit: pinned_builder makes a fresh builder" 0 pinned BK_DIR="$bk" BK_LOG="$lg"
+  name="$(sed -n 's/^builder=//p' "$TMP/out")"
+  if [ -n "$boot" ] && [[ "$name" =~ ^signer-buildkit-[0-9]{8}-[0-9]{6}-b$boot-p[0-9]+$ ]] &&
+    grep -qxF -- "buildx create --name $name --driver docker-container --driver-opt image=$ref --bootstrap" "$lg"; then
+    ok "buildkit: the fresh builder carries its run's boot and pid, and runs BUILDKIT_IMAGE"
   else
-    bad "buildkit: pinned_builder did not create the builder with BUILDKIT_IMAGE: $(cat "$lg")"
+    bad "buildkit: the fresh builder '$name' (boot '$boot'): $(cat "$lg")"
   fi
-  : >"$lg"
-  expect "buildkit: pinned_builder keeps a builder that runs BUILDKIT_IMAGE" 0 pinned BK_STATE="$st" BK_LOG="$lg"
-  if [ -s "$lg" ]; then bad "buildkit: pinned_builder changed a good builder: $(cat "$lg")"; else ok "buildkit: a good builder stays as it is"; fi
-  echo "moby/buildkit:v0.1.0" >"$st"
-  expect "buildkit: pinned_builder replaces a builder of another image" 0 pinned BK_STATE="$st" BK_LOG="$lg"
-  if grep -q '^buildx rm signer-buildkit' "$lg" && grep -q '^buildx create ' "$lg" && [ "$(cat "$st")" = "$ref" ]; then
-    ok "buildkit: the builder of another image is removed and created again"
-  else
-    bad "buildkit: the builder of another image was not replaced: $(cat "$lg")"
-  fi
-  rm -f "$st"
+  if [ -n "$name" ] && grep -qxF "buildx rm $name" "$lg"; then ok "buildkit: the builder is removed after a run that succeeds"; else bad "buildkit: the builder is removed after a run that succeeds: $(cat "$lg")"; fi
+  gone "buildkit: no builder is left after a run that succeeds"
+  fresh
+  expect "buildkit: a run that fails after pinned_builder" 1 pinned BK_DIR="$bk" BK_LOG="$lg" PINNED_EXIT=3
+  gone "buildkit: no builder is left after a run that fails"
+  fresh
+  refuses "buildkit: pinned_builder stops when the builder does not start" "cannot create or start the builder" \
+    pinned BK_DIR="$bk" BK_LOG="$lg" BK_CREATE_FAIL=1
+  gone "buildkit: a builder that does not start is removed"
+  fresh
+  refuses "buildkit: pinned_builder refuses a builder with two nodes" "has 2 nodes, not 1" \
+    pinned BK_DIR="$bk" BK_LOG="$lg" BK_CREATE_NODES=2
+  gone "buildkit: the builder with two nodes is removed"
+  fresh
   refuses "buildkit: pinned_builder refuses a new builder that runs another image" "runs .*not $ref" \
-    pinned BK_STATE="$st" BK_LOG="$lg" BK_CREATE_IMAGE=moby/buildkit:latest
+    pinned BK_DIR="$bk" BK_LOG="$lg" BK_CREATE_IMAGE=moby/buildkit:latest
+  gone "buildkit: the builder of another image is removed"
+
+  # A child script of a run (release-build.sh, generic-images.sh) gets the
+  # run's builder in BUILDKIT_BUILDER. It uses it if it has the pinned
+  # shape, and leaves it to the run that made it.
+  fresh
+  echo "docker-container 1 $ref running" >"$bk/signer-buildkit-lane"
+  expect "buildkit: pinned_builder takes the builder of the calling run" 0 pinned BK_DIR="$bk" BK_LOG="$lg" BUILDKIT_BUILDER=signer-buildkit-lane
+  if [ ! -s "$lg" ] && [ -s "$bk/signer-buildkit-lane" ]; then ok "buildkit: the calling run's builder is neither made again nor removed"; else bad "buildkit: the calling run's builder was changed: $(cat "$lg")"; fi
+  echo "docker-container 2 $ref running" >"$bk/signer-buildkit-lane"
+  refuses "buildkit: pinned_builder refuses a calling run's builder with two nodes" "has 2 nodes, not 1" \
+    pinned BK_DIR="$bk" BK_LOG="$lg" BUILDKIT_BUILDER=signer-buildkit-lane
+  echo "docker 1 $ref running" >"$bk/signer-buildkit-lane"
+  refuses "buildkit: pinned_builder refuses a calling run's builder of the docker driver" "driver 'docker', not docker-container" \
+    pinned BK_DIR="$bk" BK_LOG="$lg" BUILDKIT_BUILDER=signer-buildkit-lane
+  echo "docker-container 1 $ref stopped" >"$bk/signer-buildkit-lane"
+  refuses "buildkit: pinned_builder refuses a calling run's builder that does not run" "is 'stopped', not running" \
+    pinned BK_DIR="$bk" BK_LOG="$lg" BUILDKIT_BUILDER=signer-buildkit-lane
+  echo "docker-container 1 moby/buildkit:v0.1.0 running" >"$bk/signer-buildkit-lane"
+  refuses "buildkit: pinned_builder refuses a calling run's builder of another image" "runs .*not $ref" \
+    pinned BK_DIR="$bk" BK_LOG="$lg" BUILDKIT_BUILDER=signer-buildkit-lane
+
+  # Builders left by earlier runs: removed when their run (pid, on this
+  # boot) is gone, kept when it is alive or of another boot. The builder
+  # signer-buildkit of an earlier version, and other names, stay.
+  fresh
+  sh -c 'exit 0' &
+  dead=$!
+  wait "$dead" || true
+  for n in "signer-buildkit-20260101-000000-b$boot-p$dead" "signer-buildkit-20260101-000000-b$boot-p$$" \
+    "signer-buildkit-20260101-000000-b1-p$dead" signer-buildkit signer-buildkit-mine; do
+    echo "docker-container 1 $ref running" >"$bk/$n"
+  done
+  expect "buildkit: pinned_builder with builders of earlier runs" 0 pinned BK_DIR="$bk" BK_LOG="$lg"
+  if [ -n "$boot" ] && [ ! -s "$bk/signer-buildkit-20260101-000000-b$boot-p$dead" ]; then ok "buildkit: removes a builder whose run is gone"; else bad "buildkit: removes a builder whose run is gone: $(cat "$lg")"; fi
+  if [ -s "$bk/signer-buildkit-20260101-000000-b$boot-p$$" ]; then ok "buildkit: keeps a builder whose run is alive"; else bad "buildkit: removed a builder whose run is alive"; fi
+  if [ -s "$bk/signer-buildkit-20260101-000000-b1-p$dead" ]; then ok "buildkit: keeps a builder of another boot"; else bad "buildkit: removed a builder of another boot"; fi
+  if [ -s "$bk/signer-buildkit" ] && [ -s "$bk/signer-buildkit-mine" ]; then ok "buildkit: keeps signer-buildkit and other names"; else bad "buildkit: removed signer-buildkit or signer-buildkit-mine"; fi
 }
-# pinned VAR=VALUE...: pinned_builder of scripts/common.sh, with the docker
-# stub of t_buildkit first on PATH.
+# pinned VAR=VALUE...: pinned_builder of scripts/common.sh in a script
+# that removes its builder on exit (trap drop_builder EXIT), as the image
+# builds do, with the docker stub of t_buildkit first on PATH. It prints
+# builder=NAME, then exits with PINNED_EXIT (default 0).
 pinned() {
-  env -u SIGNER_BUILD_OVERLAY_DIR CHAIN=mainnet BK_CREATE_IMAGE= "$@" PATH="$TMP/buildkit-bin:$PATH" \
-    bash -c '. "$1/scripts/common.sh" && pinned_builder' _ "$HERE/.."
+  env -u SIGNER_BUILD_OVERLAY_DIR -u BUILDKIT_BUILDER CHAIN=mainnet BK_CREATE_IMAGE= BK_CREATE_NODES= BK_CREATE_FAIL= PINNED_EXIT= \
+    "$@" PATH="$TMP/buildkit-bin:$PATH" \
+    bash -c '. "$1/scripts/common.sh" && trap drop_builder EXIT && pinned_builder && echo "builder=$BUILDKIT_BUILDER" && exit "${PINNED_EXIT:-0}"' _ "$HERE/.."
+}
+# digest_files ROOT DIGEST: the files under ROOT that hold DIGEST, sorted,
+# each with a space after it. git grep (tracked files) in a git checkout,
+# grep over all files in a tree without git. Both skip the generated
+# folders, build/, logs/ and the other /DIR/ lines of ROOT/.gitignore:
+# build logs there name the BuildKit image.
+digest_files() {
+  local root="$1" digest="$2" gen=(build logs) spec=(.) skip="" g
+  mapfile -t -O 2 gen < <(sed -n 's|^/\(.*\)/$|\1|p' "$root/.gitignore" 2>/dev/null || true)
+  for g in "${gen[@]}"; do spec+=(":(exclude)$g") skip="$skip${skip:+|}$g"; done
+  if command -v git >/dev/null 2>&1 &&
+    [ "$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" = "$root" ]; then
+    git -C "$root" grep -l -F -- "$digest" "${spec[@]}" | LC_ALL=C sort | tr '\n' ' ' || true
+  else
+    (cd "$root" && grep -rlF --exclude-dir=.git -- "$digest" . | sed 's|^\./||' | { grep -vE "^($skip)/" || true; } | LC_ALL=C sort | tr '\n' ' ' || true)
+  fi
 }
 
 sections=("$@")

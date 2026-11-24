@@ -645,7 +645,8 @@ the key-release policy.
 A pinned BuildKit and a pinned Dockerfile frontend build the GCP, Azure and
 Nitro enclave images: the layers and the image config. `scripts/common.sh`
 names the BuildKit image by digest (`BUILDKIT_IMAGE`), and the three build
-scripts run it in their own buildx builder (docker-container driver). The
+scripts run it in a buildx builder (docker-container driver) that each run
+makes and removes at its end. The
 Dockerfiles pin the frontend by digest on their first line. The host's
 Docker only runs the BuildKit container. The first build on a host pulls
 both images from Docker Hub.

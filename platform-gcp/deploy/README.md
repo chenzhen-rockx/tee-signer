@@ -269,9 +269,10 @@ compares the digests. The context file gets an explicit mode (`install -m`,
 `COPY --chmod`), as in `platform-azure/deploy`, so the digest does not depend
 on the builder's umask. A pinned BuildKit and a pinned Dockerfile frontend
 build the image: they build and compress the layers and write the image
-config. `build-image.sh` builds on the buildx builder `BUILDKIT_BUILDER`
-(docker-container driver), which runs `BUILDKIT_IMAGE`, the BuildKit image
-that `scripts/common.sh` names by version and index digest. The
+config. `build-image.sh` makes a new buildx builder for each run
+(docker-container driver, one node) that runs `BUILDKIT_IMAGE`, the
+BuildKit image that `scripts/common.sh` names by version and index digest,
+and removes it at the end. The
 Dockerfile's first line pins the frontend
 (`# syntax=docker/dockerfile:VERSION@sha256:DIGEST`). The host's Docker only
 runs the BuildKit container and loads the OCI archive. Before the pins, the

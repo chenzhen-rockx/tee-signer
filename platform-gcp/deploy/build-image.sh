@@ -29,13 +29,18 @@
 # attestations, as in platform-azure/deploy/build-image.sh. The file modes are explicit
 # (the Dockerfile's COPY --chmod, and install -m on the context files), so the
 # digest is the same whatever the builder's umask. The pinned BuildKit
-# (BUILDKIT_IMAGE in scripts/common.sh, run by the buildx builder
-# BUILDKIT_BUILDER) and the pinned Dockerfile frontend (the Dockerfile's
+# (BUILDKIT_IMAGE in scripts/common.sh, run by a buildx builder made for
+# the run) and the pinned Dockerfile frontend (the Dockerfile's
 # first line) build the image: the layers and the image config. The host's
 # Docker only runs the BuildKit container, and loads the archive. The first
 # build on a host pulls both images from Docker Hub (network). The build
 # stops if the Dockerfile lacks the frontend pin (need_frontend_pin) or the
 # builder runs another BuildKit (pinned_builder).
+#
+# pinned_builder makes a new builder for each run (docker-container
+# driver, one node, started with --bootstrap), and the script removes it
+# when it ends, also on failure. Run from generic-images.sh or
+# release-build.sh, it builds on their builder (BUILDKIT_BUILDER).
 set -euo pipefail
 # shellcheck source=common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -89,8 +94,11 @@ done
 devnet_hook gcp_image_ctx "$CTX"
 # The Dockerfile we build, after the overlay's hook, pins the frontend.
 need_frontend_pin "$CTX/Dockerfile" || die "the Dockerfile of the build does not pin the Dockerfile frontend"
-# The pinned BuildKit builds the image (pinned_builder in scripts/common.sh).
-pinned_builder || die "the builder $BUILDKIT_BUILDER does not run the pinned BuildKit $BUILDKIT_IMAGE"
+# The pinned BuildKit builds the image, on a builder made for this run or
+# on the calling run's (pinned_builder in scripts/common.sh). drop_builder
+# removes a builder made here when the script ends.
+trap drop_builder EXIT
+pinned_builder || die "no builder that runs the pinned BuildKit $BUILDKIT_IMAGE"
 
 build_once() { # build_once <n>: archive in $OUT/runner-<n>.oci.tar, prints the manifest digest
   SOURCE_DATE_EPOCH=0 docker buildx build --builder "$BUILDKIT_BUILDER" -q --no-cache --provenance=false --sbom=false \
@@ -118,7 +126,7 @@ echo "$d1" >"$OUT/runner.digest"
 # in, with the modes the Dockerfile sets, and nothing of an operator.
 docker load -i "$OUT/runner.oci.tar" >/dev/null
 cid="$(docker create "$LOCAL_RUNNER_IMAGE")"
-trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+trap 'docker rm -f "$cid" >/dev/null 2>&1 || true; drop_builder' EXIT
 if docker cp "$cid:/etc/signer" - >/dev/null 2>&1; then
   die "the image has /etc/signer: a generic image holds no chain config and no client CA"
 fi
