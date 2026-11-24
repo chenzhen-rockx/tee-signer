@@ -101,11 +101,12 @@ type ObjectLocker interface {
 }
 
 // ErrNameTaken: the next name is taken by an object that is not a record
-// (or not a commit), and the store does not show that the object stays at
-// least as long as a record written now would. The writer neither skips
-// the name nor writes there. It does not latch: a later write tries the
-// same name again.
-var ErrNameTaken = errors.New("markstore: the next name holds an object that is not a record and that may be deleted before a record there could be")
+// (or not a commit), and the writer may not skip it: the mark log skips
+// only an object the store shows to stay at least as long as a record
+// written now (CheckKept), the state copy never skips. The writer neither
+// skips the name nor writes there. It does not latch: a later write tries
+// the same name again.
+var ErrNameTaken = errors.New("markstore: the next name holds an object that is not a record or commit, and the writer may not skip it")
 
 // lockMargin is how much shorter than a record's retention the retention
 // of an object under a skipped name may be. S3 dates a record's retention
@@ -125,14 +126,19 @@ const lockMargin = 15 * time.Minute
 // entries, keep 0 (the retention is not known), a store that cannot
 // report an object's lock, or a read that fails.
 //
-// Another writer that comes to the name later does not skip it too: by
-// then the object's date is short of its own now + keep - lockMargin, so
-// it gets ErrNameTaken and stops. What keeps it from writing the name
-// once the object is gone is the write age latch (MarkLog.staleLocked):
-// it writes nothing more than keep/2 after its last record, and the
-// object stays at least keep - lockMargin after the skip, which came
-// after that record. The rule is safe only together with that latch;
-// a log without it (no setup) must never skip.
+// Another writer that comes to the name later either skips it too, when
+// the object's date also covers its own now + keep - lockMargin, and the
+// two then meet at the next name; or it gets ErrNameTaken and stops. What
+// keeps a stopped writer from writing the name once the object is gone is
+// the write age latch (MarkLog.staleLocked): it writes nothing more than
+// keep/2 after its last record, and the object stays at least
+// keep - lockMargin after the skip, which came after that record. The
+// rule is safe only together with that latch; a log without it (no setup,
+// the first record of a log, the state copy) must never skip.
+//
+// The rule dates the lock by the caller's trusted clock and assumes that
+// clock does not lag real time; the claim refuses a clock that lags the
+// newest record by more than lockMargin (ErrClockBehind).
 func CheckKept(ctx context.Context, l Log, es []Entry, now time.Time, keep time.Duration) error {
 	if len(es) == 0 {
 		return fmt.Errorf("%w: the name lists no object", ErrNameTaken)

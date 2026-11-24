@@ -359,23 +359,31 @@ roll the mark back.
   `slashing_log_min_lock_days`, less 15 minutes (`markstore.CheckKept`).
   Nobody can then delete the object before a record under that name could
   go. Each such name costs a skip, up to 16 in a row. Another instance
-  that comes to the name later does not skip it: the object's date is then
-  too short for its own write, so it stops with `markstore.ErrNameTaken`.
-  The write age check keeps that instance from writing the name after the
-  object is gone. It writes nothing more than half the retention after its
-  last record, and the object stays for the retention less 15 minutes
-  after the skip. So the skip is safe only with the write age check, and a
-  log without a setup, which has no such check, never skips a taken name.
+  that comes to the name later skips it too if the object's date also
+  covers its own write, and the two then meet at the next name. Otherwise
+  it stops with `markstore.ErrNameTaken`, and the write age check keeps
+  it from writing the name after the object is gone. It writes nothing
+  more than half the retention after its last record, and the object
+  stays for the retention less 15 minutes after the skip. So the skip is
+  safe only with the write age check. A log without a setup and the first
+  record of a log have nothing for that check to count from, and never
+  skip a taken name. The rule assumes the trusted clock does not lag real
+  time; a claim refuses a clock that lags the newest record by more than
+  15 minutes (`markstore.ErrClockBehind`).
 - Any other object under the next name stops the write
   (`markstore.ErrNameTaken`): no retention, S3 governance mode, a shorter
   date, a GCS or Azure policy that is not locked, a store that cannot
-  report an object's lock, a lock read that fails, or a log without a
-  setup. The stop does
-  not latch. Once the object is gone, the next write takes the name. Until
-  then the core signs nothing past the committed mark, and a start fails
-  at its claim. The writer never passes such an object, because an
-  instance that skipped it and one that writes its name after a delete
-  would never meet.
+  report an object's lock, a lock read that fails, a log without a setup,
+  or the first record of a log. The stop does not latch, and until it ends
+  the core signs nothing past the committed mark and a start fails at its
+  claim. If the object goes within half the retention of the last record,
+  the next write takes the name. An object that stays longer cannot clear
+  in time: the write age check stops the writer first (`ErrStale`), and
+  the signer needs a new setup and a re-import. On a locked GCS or Azure
+  store that is any object made more than 15 minutes before the writer
+  reaches its name, since the lock runs from the object's creation. The
+  writer never passes such an object, because an instance that skipped it
+  and one that writes its name after a delete would never meet.
 - A listed object that reads as not found is an error, not an absent
   object. A write that meets one fails without a skip and without a latch,
   and a start fails. The listing says the object is there, and reading
@@ -383,8 +391,9 @@ roll the mark back.
 - More than 16 locked names in a row stop every write and every start for
   their retention, and one such object on a new log stops its first
   claim. Many names above the newest record can also push the claim past
-  its timeout. The state copy has the same rules, with the copy's
-  retention (`statestore.Options.RetainDays`). Whoever can
+  its timeout. The state copy never skips: it has no write age check,
+  so any object that is not a commit under its next name stops its
+  commits until it is gone (`durable-state.md`). Whoever can
   create objects in the bucket can stop the signer this way, as they can
   by taking the runner's access away. The design trusts the storage
   admin for liveness, not for safety: nothing they write makes the runner
@@ -723,15 +732,19 @@ holds its true mark.
 - A signer down, or cut off from its store, longer than half the
   retention period: the age check stops it at the claim, the write age
   check while it runs, and it needs a new setup and a re-import.
-- Objects under future record names. Anyone who can write the log's
-  bucket (an admin, or the runner's own cloud identity) can create junk
-  under the next version names. One object that is not locked as long as
-  a record stops every write until it is gone. Seventeen locked ones in a
-  row stop every write for their retention. Either way the core signs
-  nothing past the committed mark, and a start fails at its claim record.
-  Locked junk stays for the retention period, so the signer then needs a
-  new setup and a re-import. This costs liveness, never a mark: no writer
-  passes a name whose object could be deleted later.
+- Objects under future record names. Anyone who can write the log's bucket
+  (an admin, or the runner's own cloud identity) can create junk under the
+  next version names. One object that is not locked as long as a record
+  stops every write until it is gone. Seventeen locked ones in a row stop
+  every write for their retention. Either way the core signs nothing past
+  the committed mark, and a start fails at its claim record. If the junk
+  stays longer than half the retention after the last record, the stop
+  does not clear: the write age check ends the setup, and the signer needs
+  a new setup and a re-import. On a locked GCS or Azure store one object
+  made more than 15 minutes before the writer reaches its name is enough,
+  and so are seventeen locked ones on any store. This costs liveness,
+  never a mark: no writer passes a name whose object could be deleted
+  later.
 - S3's default retention is a bucket setting. An admin with
   `s3:PutBucketObjectLockConfiguration` can lower or remove it after the
   start's check. The runner's own objects are not affected, since each PUT

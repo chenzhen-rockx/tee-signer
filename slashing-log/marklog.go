@@ -43,6 +43,13 @@ var ErrUnreadable = errors.New("markstore: a record of this signer is one this r
 // needs a new setup and a re-import.
 var ErrTooOld = errors.New("markstore: the newest record is older than half the retention; update bodies may have expired")
 
+// ErrClockBehind: the newest record is dated more than lockMargin after
+// the trusted clock at the claim. The instance that wrote it had a clock
+// ahead of this one, so this one lags real time or the other led it by
+// far more than a trusted clock may. The skip rule (CheckKept) and the
+// write age check assume a clock that does not lag, so the claim refuses.
+var ErrClockBehind = errors.New("markstore: the newest record is dated after the trusted clock; this runner's clock lags")
+
 // ErrStale: this runner wrote no record for half of
 // slashing_log_min_lock_days (the store was cut off, or a write landed that
 // late). A clone may have claimed the log meanwhile and its records may
@@ -577,6 +584,17 @@ func (m *MarkLog) Claim(ctx context.Context, expect bool) (backend.Watermark, bo
 			return backend.Watermark{}, false, fmt.Errorf("mark log %s: %w", m.log, err)
 		}
 		written := time.Unix(int64(r.Time), 0)
+		// A newest record from this clock's future means this clock lags
+		// the one that wrote it. The skip rule (CheckKept) and the write
+		// age check hold only for a clock that does not lag, so refuse.
+		// The bound is lockMargin, the clock error the skip rule already
+		// allows for: trusted clocks lead by under two minutes, so a right
+		// clock never sees a record that far ahead, and a clock that lags
+		// by less moves a lock's needed date by less than lockMargin.
+		if ahead := written.Sub(now); ahead > lockMargin {
+			return backend.Watermark{}, false, fmt.Errorf("mark log %s: %w: version %d is dated %s after the trusted clock, more than %s (refusing)",
+				m.log, ErrClockBehind, r.Version, ahead.Round(time.Second), lockMargin)
+		}
 		if age := now.Sub(written); age > m.opt.Setup.Retention()/2 {
 			return backend.Watermark{}, false, fmt.Errorf("mark log %s: %w: version %d was written %s ago, the retention is %d days (a new setup and a re-import are needed)",
 				m.log, ErrTooOld, r.Version, age.Round(time.Second), m.opt.Setup.RetentionDays)
@@ -850,11 +868,12 @@ func (m *MarkLog) ackLocked(base, at time.Time) error {
 }
 
 // keep is the retention a record written now gets at least: the setup's
-// slashing_log_min_lock_days. 0 without a setup, so the flag path never
-// skips a taken name: a skip is safe only with the write age latch
-// (staleLocked), and the flag path has none.
-func (m *MarkLog) keep() time.Duration {
-	if m.opt.Setup != nil {
+// slashing_log_min_lock_days. A skip is safe only with the write age latch
+// (staleLocked), so keep is 0, and CheckKept never skips, where that latch
+// has nothing to check: without a setup (the flag path), and for the first
+// record of a log, which has no record before it (base is zero).
+func (m *MarkLog) keep(base time.Time) time.Duration {
+	if m.opt.Setup != nil && !base.IsZero() {
 		return m.opt.Setup.Retention()
 	}
 	return 0
@@ -948,8 +967,8 @@ func (m *MarkLog) appendLocked(ctx context.Context, wm backend.Watermark) error 
 				// there could go. A writer that skipped a deletable object
 				// and one that writes the name after the delete would never
 				// meet. Otherwise stop, without a latch.
-				if kerr := CheckKept(ctx, m.log, mine, now, m.keep()); kerr != nil {
-					m.opt.Log.Error("mark log: name taken by an object that is not a record and that is not locked as long as a record; "+
+				if kerr := CheckKept(ctx, m.log, mine, now, m.keep(base)); kerr != nil {
+					m.opt.Log.Error("mark log: name taken by an object that is not a record and that this write may not skip; "+
 						"no records are written, and nothing is signed above the committed mark, until it is gone", "version", v, "err", kerr)
 					return fmt.Errorf("markstore: version %d: %w", v, kerr)
 				}

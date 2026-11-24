@@ -465,6 +465,41 @@ func Run(t *testing.T, kind wormfake.Kind, newLog NewLog) {
 		}
 	})
 
+	t.Run("objects under the next name: the lock ends at the object's own date", func(t *testing.T) {
+		// Under the default lock (S3 default retention, a locked GCS or
+		// Azure policy, 30 days as the setup's retention) an object is kept
+		// until its creation plus the period. A writer that reaches it
+		// later than lockMargin (15 minutes) after that needs more than
+		// the object has left, and stops; one that comes sooner skips it.
+		for _, c := range []struct {
+			after time.Duration
+			skips bool
+		}{{after: 16 * time.Minute}, {after: 10 * time.Minute, skips: true}} {
+			srv, l := fresh(t)
+			m := open(t, srv, l, nil, key(1))
+			if _, _, err := m.Claim(ctx, false); err != nil {
+				t.Fatal(err)
+			}
+			_, v := m.Mark()
+			srv.AdminCreate(name(v+1), []byte("not a record"))
+			srv.Advance(c.after)
+			err := m.Append(ctx, wm(4, 5, 160))
+			_, v2 := m.Mark()
+			if c.skips {
+				if err != nil || v2 != v+2 {
+					t.Fatalf("object made %s ago: err %v, version %d; want a skip to %d", c.after, err, v2, v+2)
+				}
+				continue
+			}
+			if !errors.Is(err, markstore.ErrNameTaken) || v2 != v {
+				t.Fatalf("object made %s ago: err %v, version %d; want ErrNameTaken at %d", c.after, err, v2, v)
+			}
+			if _, ok := srv.Current(name(v + 2)); ok || m.Lost() != nil {
+				t.Fatalf("wrote past it (%v) or latched (%v)", ok, m.Lost())
+			}
+		}
+	})
+
 	t.Run("restart with lost local state", func(t *testing.T) {
 		srv, l := fresh(t)
 		m := open(t, srv, l, memStore{}, key(1))

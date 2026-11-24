@@ -112,10 +112,11 @@ checks before and again after the read, so a store that changes in
 between stops the start too. A commit name taken by a
 valid commit of another process means a clone: that process changes no
 durable state from then on (`ErrLost`). An object that is not a commit
-costs a skip only if it is locked as long as a commit; any other stops
-the commit until it is gone, as in the mark log (`marklog.md`, objects
-under future names). A listed commit that reads as not found stops the
-start.
+under the next name stops the commit until it is gone, however long it
+is locked (`markstore.ErrNameTaken`). Unlike the mark log, the copy never
+skips such a name: a skip is safe only with a write age check, and the
+copy has none (`marklog.md`, objects under future names). A listed
+commit that reads as not found stops the start.
 
 ### All or nothing
 

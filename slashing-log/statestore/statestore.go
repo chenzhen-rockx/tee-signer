@@ -94,7 +94,6 @@ const (
 	maxInline = 128 << 10
 	maxTail   = 256 << 10
 	maxChain  = 64
-	maxSkips  = 16
 	nonceLen  = 12
 )
 
@@ -145,14 +144,8 @@ type Options struct {
 	// Clock is the trusted clock. Commit times and the refresh age read
 	// it, and a commit or a refresh fails when it errors. nil: Now.
 	Clock func() (time.Time, error)
-	// RetainDays is the retention each object of the copy gets
-	// (markstore.Env.RetainDays, slashing_log_min_lock_days). A commit
-	// skips a name taken by an object that is not a commit only if that
-	// object is locked at least this long (markstore.CheckKept). 0: it
-	// never skips one.
-	RetainDays uint32
-	Now        func() time.Time
-	Log        *slog.Logger
+	Now   func() time.Time
+	Log   *slog.Logger
 }
 
 // Store is a platform.Store whose durable keys are copied to the object

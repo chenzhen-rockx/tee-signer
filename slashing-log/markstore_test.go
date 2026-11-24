@@ -448,8 +448,14 @@ func TestSquattedNamesSkipped(t *testing.T) {
 		l.objs[name(v)] = [][]byte{[]byte("junk")}
 		l.lockFor(name(v), until)
 	}
-	if err := m2.Append(ctx, mark(11)); err == nil {
-		t.Fatal("wrote past more squatted names than allowed")
+	// The bound stops the write, not the lock rule: every name has a lock
+	// long enough to skip.
+	err := m2.Append(ctx, mark(11))
+	if err == nil || errors.Is(err, ErrNameTaken) || !strings.Contains(err.Error(), "names after version") {
+		t.Fatalf("append past more squatted names than allowed: %v; want the skip bound", err)
+	}
+	if n := len(l.objs[name(6+maxSkips+2)]); n != 0 {
+		t.Fatalf("wrote %d objects past the squatted names", n)
 	}
 }
 

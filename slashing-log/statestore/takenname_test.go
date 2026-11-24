@@ -9,102 +9,62 @@ import (
 	"github.com/lidofinance/tee-signer/slashing-log"
 )
 
-// A commit skips a name taken by an object that is not a commit only if
-// the object is locked in compliance mode at least as long as a commit
-// gets (Options.RetainDays). An object without retention stops the commit
-// (markstore.ErrNameTaken) and nothing is written past it, so a clone
-// cannot commit beside the first instance once the object is deleted.
-func TestCommitSkipsOnlyLockedNames(t *testing.T) {
+// A commit never skips a name taken by an object that is not a commit,
+// however long the object is locked. The copy has no write age latch, and
+// a skip is safe only with one (markstore.CheckKept): a process cut off
+// for the whole lock could commit at the name once the object is gone,
+// beside a clone that skipped it, and a restart would drop that commit.
+// The commit stops (markstore.ErrNameTaken) and writes nothing past the
+// name; once the object is gone, the next commit takes the name.
+func TestCommitNeverSkipsATakenName(t *testing.T) {
 	const days = 30
-	opt := Options{RetainDays: days}
-	plant := func(l *memLog, lock *markstore.ObjectLock) []string {
-		var planted []string
-		for v := uint64(2); v < 2+maxSkips; v++ {
-			n := Name(setupA, "signer-1", v)
-			l.objs[n] = [][]byte{[]byte("not a commit")}
-			if lock != nil {
-				l.locks[n] = *lock
-			}
-			planted = append(planted, n)
-		}
-		return planted
-	}
-	top := Name(setupA, "signer-1", 2+maxSkips)
-
-	t.Run("no retention: the clone stops", func(t *testing.T) {
-		l := newMemLog()
-		l.locks = map[string]markstore.ObjectLock{}
-		a, _ := open(t, newLocal(t), l, keysOf("image-a"), opt)
-		if err := a.Put("shares/aa", []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		b, err := open(t, newLocal(t), l, keysOf("image-a"), opt)
-		if err != nil {
-			t.Fatal(err)
-		}
-		planted := plant(l, nil)
-		err = b.Put("shares/bb", []byte("b"))
-		if !errors.Is(err, markstore.ErrNameTaken) || len(l.objs[top]) != 0 {
-			t.Fatalf("clone commit over deletable objects: %v, objects past them: %d; want ErrNameTaken and none", err, len(l.objs[top]))
-		}
-		for _, n := range planted {
-			delete(l.objs, n)
-		}
-		if err := a.Put("shares/cc", []byte("a")); err != nil {
-			t.Fatalf("A once the names are free: %v", err)
-		}
-		if err := b.Put("shares/bb", []byte("b")); err == nil {
-			t.Fatal("the clone committed after A did: two writers of one copy")
-		}
-	})
-
-	t.Run("compliance for a record retention: skipped", func(t *testing.T) {
-		l := newMemLog()
-		l.locks = map[string]markstore.ObjectLock{}
-		a, _ := open(t, newLocal(t), l, keysOf("image-a"), opt)
-		if err := a.Put("shares/aa", []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		b, _ := open(t, newLocal(t), l, keysOf("image-a"), opt)
-		plant(l, &markstore.ObjectLock{Mode: "COMPLIANCE", Compliance: true, RetainUntil: time.Now().Add(days*24*time.Hour + time.Hour)})
-		if err := b.Put("shares/bb", []byte("b")); err != nil || len(l.objs[top]) != 1 {
-			t.Fatalf("clone commit past locked objects: %v", err)
-		}
-		if err := a.Put("shares/cc", []byte("a")); !errors.Is(err, ErrLost) {
-			t.Fatalf("A past the same locked objects: %v, want ErrLost", err)
-		}
-	})
-
-	t.Run("governance or short: the commit stops", func(t *testing.T) {
-		for _, lk := range []markstore.ObjectLock{
-			{Mode: "GOVERNANCE", RetainUntil: time.Now().Add(2 * days * 24 * time.Hour)},
-			{Mode: "COMPLIANCE", Compliance: true, RetainUntil: time.Now().Add(24 * time.Hour)},
-		} {
+	opt := Options{}
+	for _, c := range []struct {
+		name string
+		lock *markstore.ObjectLock
+	}{
+		{name: "no retention"},
+		{name: "governance", lock: &markstore.ObjectLock{Mode: "GOVERNANCE", RetainUntil: time.Now().Add(2 * days * 24 * time.Hour)}},
+		{name: "compliance, one day", lock: &markstore.ObjectLock{Mode: "COMPLIANCE", Compliance: true, RetainUntil: time.Now().Add(24 * time.Hour)}},
+		{name: "compliance, longer than a commit", lock: &markstore.ObjectLock{Mode: "COMPLIANCE", Compliance: true, RetainUntil: time.Now().Add(days*24*time.Hour + time.Hour)}},
+		{name: "compliance, a year", lock: &markstore.ObjectLock{Mode: "COMPLIANCE", Compliance: true, RetainUntil: time.Now().Add(365 * 24 * time.Hour)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
 			l := newMemLog()
 			l.locks = map[string]markstore.ObjectLock{}
 			a, _ := open(t, newLocal(t), l, keysOf("image-a"), opt)
 			if err := a.Put("shares/aa", []byte("x")); err != nil {
 				t.Fatal(err)
 			}
-			plant(l, &lk)
-			if err := a.Put("shares/bb", []byte("b")); !errors.Is(err, markstore.ErrNameTaken) || len(l.objs[top]) != 0 {
-				t.Fatalf("%s: commit over the objects: %v", lk.Mode, err)
+			b, err := open(t, newLocal(t), l, keysOf("image-a"), opt)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-	})
-
-	t.Run("no retention known: the commit stops", func(t *testing.T) {
-		l := newMemLog()
-		l.locks = map[string]markstore.ObjectLock{}
-		a, _ := open(t, newLocal(t), l, keysOf("image-a"), Options{})
-		if err := a.Put("shares/aa", []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		plant(l, &markstore.ObjectLock{Mode: "COMPLIANCE", Compliance: true, RetainUntil: time.Now().Add(365 * 24 * time.Hour)})
-		if err := a.Put("shares/bb", []byte("b")); !errors.Is(err, markstore.ErrNameTaken) {
-			t.Fatalf("commit over locked objects without RetainDays: %v", err)
-		}
-	})
+			taken := Name(setupA, "signer-1", 2)
+			l.objs[taken] = [][]byte{[]byte("not a commit")}
+			if c.lock != nil {
+				l.locks[taken] = *c.lock
+			}
+			next := Name(setupA, "signer-1", 3)
+			for _, s := range []*Store{b, a} {
+				if err := s.Put("shares/bb", []byte("b")); !errors.Is(err, markstore.ErrNameTaken) || len(l.objs[next]) != 0 {
+					t.Fatalf("commit over the object: %v, objects past it: %d; want ErrNameTaken and none", err, len(l.objs[next]))
+				}
+			}
+			if a.lost != nil || b.lost != nil {
+				t.Fatalf("a taken name latched: %v, %v", a.lost, b.lost)
+			}
+			// The object goes: the first commit takes the name, the other
+			// then meets it.
+			delete(l.objs, taken)
+			if err := a.Put("shares/cc", []byte("a")); err != nil {
+				t.Fatalf("A once the name is free: %v", err)
+			}
+			if err := b.Put("shares/bb", []byte("b")); !errors.Is(err, ErrLost) {
+				t.Fatalf("the clone after A committed: %v, want ErrLost", err)
+			}
+		})
+	}
 }
 
 // notFoundLog answers ErrNotFound for every GET of the names in lie.

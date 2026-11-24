@@ -3,6 +3,7 @@ package markstore
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,7 +128,9 @@ func TestTakenNameSkippedOnlyWhenLocked(t *testing.T) {
 	}
 }
 
-// More than maxSkips locked objects in a row stop the write too.
+// More than maxSkips locked objects in a row stop the write too. The
+// stop is the skip bound, not ErrNameTaken: every name is skipped up to
+// the bound, and nothing is written past the last one.
 func TestLockedNamesBoundBySkips(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1_800_000_000, 0)
@@ -142,8 +145,12 @@ func TestLockedNamesBoundBySkips(t *testing.T) {
 		l.objs[name(v)] = [][]byte{[]byte("junk")}
 		l.lockFor(name(v), now.Add(opt.Setup.Retention()+25*time.Hour))
 	}
-	if err := m.Append(ctx, mark(11)); err == nil {
-		t.Fatal("wrote past more locked names than maxSkips")
+	err := m.Append(ctx, mark(11))
+	if err == nil || errors.Is(err, ErrNameTaken) || !strings.Contains(err.Error(), "names after version") {
+		t.Fatalf("append past more locked names than maxSkips: %v; want the skip bound", err)
+	}
+	if n := len(l.objs[name(2+maxSkips+1)]); n != 0 {
+		t.Fatalf("wrote %d objects past the locked names", n)
 	}
 }
 
@@ -226,5 +233,38 @@ func TestFlagPathNeverSkips(t *testing.T) {
 	l.lockFor(name(2), now.Add(365*24*time.Hour))
 	if err := m.Append(ctx, mark(10)); !errors.Is(err, ErrNameTaken) || len(l.objs[name(3)]) != 0 {
 		t.Fatalf("flag path append over a locked object: %v, objects at 3: %d; want ErrNameTaken and none", err, len(l.objs[name(3)]))
+	}
+}
+
+// plantLog is memLog where an object appears under a name just before the
+// writer's first create there: after the claim listed the log.
+type plantLog struct {
+	*memLog
+	plant map[string]time.Time // name: the compliance date of the object
+}
+
+func (l *plantLog) Create(ctx context.Context, name string, data []byte) error {
+	if until, ok := l.plant[name]; ok {
+		delete(l.plant, name)
+		l.objs[name] = [][]byte{[]byte("not a record")}
+		l.lockFor(name, until)
+	}
+	return l.memLog.Create(ctx, name, data)
+}
+
+// The first record of a log has no record before it, so the write age
+// latch has no base to count from. Without that latch a skip is not safe:
+// the first record never skips a taken name, however long its lock.
+func TestFirstRecordNeverSkips(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_800_000_000, 0)
+	opt := Options{Setup: testSetup("signer-1"), Clock: clockAt(&now), Log: quiet}
+	name := func(v uint64) string { return Name(opt.Setup.Hash, "signer-1", v) }
+	l := &plantLog{memLog: &memLog{objs: map[string][][]byte{}},
+		plant: map[string]time.Time{name(1): now.Add(10 * opt.Setup.Retention())}}
+	m, _ := New(l, "signer-1", testKey(1), opt)
+	_, _, err := m.Claim(ctx, false)
+	if !errors.Is(err, ErrNameTaken) || len(l.objs[name(2)]) != 0 {
+		t.Fatalf("first claim over a locked object: %v, objects at 2: %d; want ErrNameTaken and none", err, len(l.objs[name(2)]))
 	}
 }
