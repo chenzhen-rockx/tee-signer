@@ -10,7 +10,10 @@
 #                                           their fingerprints to DIR/fingerprints.txt
 #                                           (default build/generic)
 #   scripts/generic-images.sh check FILE    compare the current build outputs
-#                                           with FILE, the recorded values
+#                                           with FILE, the recorded values; FILE
+#                                           must hold each name once, in the
+#                                           format build writes; a release's
+#                                           lane lines are shown, not compared
 #
 # DVT=1 (scripts/common.sh) builds the dvt images: runners with the tag dvt
 # and the DVT core, with "-dvt" after the chain's suffix in every name
@@ -135,16 +138,73 @@ cmd_build() {
   log "done in $(( $(date +%s) - start )) s: $dir/fingerprints.txt"
 }
 
-# check FILE: every "name value" line of FILE equals the current build's.
+# The names fingerprints writes, in its order.
+FINGERPRINT_NAMES=(nitro.PCR0 nitro.PCR1 nitro.PCR2 nitro.runner parent.hostagent parent.forwarder
+  parent.udprelay azure.image azure.cce_policy azure.runner gcp.image gcp.runner)
+
+# fingerprint_format NAME: the regex a value of NAME must match, as
+# fingerprints writes it; fails for a name it does not write.
+fingerprint_format() {
+  case "$1" in
+    nitro.PCR0 | nitro.PCR1 | nitro.PCR2) echo '^[0-9a-f]{96}$' ;;
+    nitro.runner | parent.hostagent | parent.forwarder | parent.udprelay | azure.runner | gcp.runner) echo '^[0-9a-f]{64}$' ;;
+    azure.image | gcp.image) echo '^sha256:[0-9a-f]{64}$' ;;
+    azure.cce_policy) echo '^([0-9a-f]{64}|none)$' ;;
+    *) return 1 ;;
+  esac
+}
+
+# The lane lines release/release-build.sh adds to a release's
+# fingerprints-<chain>.txt, in its order.
+LANE_NAMES=(variant build_variant commit chain)
+
+# check FILE: FILE holds each name of fingerprints once, as "name value"
+# with the value in the format fingerprints writes, and each value equals
+# the current build's. A release file's lane lines (LANE_NAMES) may each
+# appear once, with a value release-build.sh writes; the build outputs do
+# not record them, so they are printed as not compared. Blank lines and
+# lines that start with # are skipped; any other line refuses the whole
+# file before anything is compared. FILE is data: it is read with read and
+# compared in the shell, and no part of it goes into a sed program or a
+# command.
 cmd_check() {
-  local file="${1:-}" ok=1 name want got
+  local file="${1:-}" ok=1 line name want got format n=0
   [ -n "$file" ] || die "check needs FILE, the recorded fingerprints"
   [ -s "$file" ] || die "no $file"
-  while read -r name want; do
-    case "$name" in "" | \#*) continue ;; esac
-    got="$(fingerprints | sed -n "s/^$name //p")"
-    if [ "$got" = "$want" ]; then echo "ok    $name ${want:0:24}..."; else echo "FAIL  $name '$got', want $want"; ok=0; fi
+  local -A rec=() cur=() lane=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    case "$line" in "" | \#*) continue ;; esac
+    if [[ "$line" =~ ^(variant|build_variant|commit|chain)\ ([^[:space:]]+)$ ]]; then
+      name="${BASH_REMATCH[1]}" want="${BASH_REMATCH[2]}"
+      case "$name" in
+        variant) [[ "$want" =~ ^(test|prod)$ ]] ;;
+        build_variant) [[ "$want" =~ ^(default|dvt)$ ]] ;;
+        commit) [[ "$want" =~ ^[0-9a-f]{40}$ ]] ;;
+        chain) [[ " $CHAINS " == *" $want "* ]] ;;
+      esac || die "$file line $n: $name value is not one release-build.sh writes"
+      [ -z "${lane[$name]+x}" ] || die "$file line $n: $name given twice"
+      lane[$name]="$want"
+      continue
+    fi
+    [[ "$line" =~ ^([a-z]+\.[A-Za-z0-9_]+)\ ([^[:space:]]+)$ ]] || die "$file line $n: not a \"name value\" line"
+    name="${BASH_REMATCH[1]}" want="${BASH_REMATCH[2]}"
+    format="$(fingerprint_format "$name")" || die "$file line $n: unknown name $name"
+    [[ "$want" =~ $format ]] || die "$file line $n: $name value is not in the format build writes"
+    [ -z "${rec[$name]+x}" ] || die "$file line $n: $name given twice"
+    rec[$name]="$want"
   done <"$file"
+  for name in "${FINGERPRINT_NAMES[@]}"; do
+    [ -n "${rec[$name]+x}" ] || die "$file has no $name"
+  done
+  while read -r name got; do cur[$name]="$got"; done < <(fingerprints)
+  for name in "${FINGERPRINT_NAMES[@]}"; do
+    want="${rec[$name]}" got="${cur[$name]:-}"
+    if [ "$got" = "$want" ]; then echo "ok    $name ${want:0:24}..."; else echo "FAIL  $name '$got', want $want"; ok=0; fi
+  done
+  for name in "${LANE_NAMES[@]}"; do
+    [ -z "${lane[$name]+x}" ] || echo "--    $name ${lane[$name]} (release lane value, not compared)"
+  done
   [ "$ok" = 1 ] || die "the build differs from $file"
 }
 
