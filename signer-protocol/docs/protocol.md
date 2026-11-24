@@ -1266,6 +1266,19 @@ root CA            no role mark, key offline
 Every certificate of the chain must allow `clientAuth` (or list no
 extended key usage); Go's verifier refuses the handshake otherwise.
 
+The client sends at most three certificates: the leaf, its intermediate
+and optionally the root. Each is at most 8 KiB and has an ECDSA P-256
+or P-384, Ed25519, or RSA key of 2048 to 4096 bits. A copy of a CA
+certificate of `allowed_client_ca` sent after the leaf does not count and
+may have any key. The runner refuses any other list before it checks a
+signature (`signer-protocol/clientcert`). A refused chain, for any
+reason, reaches the client as the TLS alert `bad certificate`; the runner
+logs the reason. The gateway, signer-admin and the other tools of
+`attestation-verify/runnerclient` check their certificate file with the
+same rule when they load it and do not start with a file the runner
+would refuse. They do not know `allowed_client_ca`, so there any
+self-signed certificate after the leaf counts as such a copy.
+
 The runner checks the chain's dates against its trusted clock, never the
 system clock (ATTEST-ROLES-03): in the handshake, and again before every
 request on the connection. Once the trusted clock passes the earliest

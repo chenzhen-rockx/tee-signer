@@ -259,7 +259,9 @@ func TestE2EMutualTLS(t *testing.T) {
 	// name, so force it to present the rogue one.
 	rogue := rogueCfg.Certificates[0]
 	forced := &tls.Config{GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &rogue, nil }}
-	if err := try("client certificate from another CA", remote.WithTLS(forced, remote.DevVerifier)); !strings.Contains(err.Error(), "unknown certificate authority") {
+	// The runner checks the chain after crypto/tls, which then sends the
+	// alert bad certificate whatever the reason (tee-signer/attls).
+	if err := try("client certificate from another CA", remote.WithTLS(forced, remote.DevVerifier)); !strings.Contains(err.Error(), "bad certificate") {
 		t.Fatalf("want the runner to reject the CA, got %v", err)
 	}
 	if err := try("pinned to another key", remote.WithTLS(goodCfg, nil), remote.WithTLSKeyPin(make([]byte, 32))); !strings.Contains(err.Error(), "pinned") {
@@ -323,7 +325,9 @@ func TestE2EClientCertificateUsesTheRunnerClock(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		_, err := ahead.Health(ctx)
-		if err != nil && strings.Contains(err.Error(), "expired certificate") {
+		// The alert is bad certificate for any refused chain; the runner
+		// with the normal clock took the same certificate.
+		if err != nil && strings.Contains(err.Error(), "bad certificate") {
 			t.Logf("client certificate valid for 1 h: accepted by a runner with the normal clock, refused by one 2 h ahead: %v", err)
 			return
 		}

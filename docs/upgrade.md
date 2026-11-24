@@ -182,6 +182,23 @@ starting: the runner logs a warning at start and HEALTH says
 run, prints a WARNING and passes. Make the next setup of such a signer
 with 7 days or more.
 
+## Client certificate files: at most three certificates
+
+From this release the runner refuses, in the TLS handshake, a client
+certificate list that no client chain of the role model has: more than
+three certificates (leaf, intermediate, root), a certificate over 8 KiB,
+or a key other than ECDSA P-256 or P-384, Ed25519, or RSA of 2048 to 4096
+bits. A copy of a CA certificate of `allowed_client_ca` after the leaf
+does not count. The client then sees only the TLS alert `bad
+certificate`; the runner log names the reason
+([protocol.md](../signer-protocol/docs/protocol.md), "Client roles").
+Certificates from `signer-admin issue-client-cert` and
+`scripts/make-test-ca.sh` fit. Before the rollout, count the certificates
+and read the key kinds in every client file that reaches a runner: the
+gateway's `signers.client_cert`, signer-admin connection files, and any
+other client. Upgrade the client tools first (step 2): the new gateway
+and signer-admin refuse such a file at start and name the bound.
+
 ## Rules
 
 - Keep t of n signers up. Switch one signer at a time, and finish it
