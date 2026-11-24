@@ -31,7 +31,7 @@ func (a *Attestation) newMAA(o *optset.Options) (*maaVerifier, error) {
 	}
 	return &maaVerifier{
 		opts: attest.MAAOptions{Issuer: s.issuer, ComplianceStatus: s.compliance, HostData: []string{s.hostData}},
-		keys: &keySource{name: "MAA", issuer: s.issuer, http: o.HTTP},
+		keys: &keySource{name: "MAA", issuer: s.issuer, http: o.HTTP, pinned: o.KeySet},
 	}, nil
 }
 

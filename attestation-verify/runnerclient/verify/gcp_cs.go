@@ -127,9 +127,16 @@ func (a *Attestation) newGCP(o *optset.Options) (*gcpVerifier, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.pinned != nil && o.KeySet != nil {
+		return nil, errors.New("attestation: gcp_jwks_file and a pinned key set (WithKeySet) both set; pin one key set")
+	}
+	pinned := s.pinned
+	if pinned == nil {
+		pinned = o.KeySet
+	}
 	return &gcpVerifier{
 		opts: s.opts,
-		keys: &keySource{name: "Confidential Space", issuer: s.issuer, http: o.HTTP, pinned: s.pinned},
+		keys: &keySource{name: "Confidential Space", issuer: s.issuer, http: o.HTTP, pinned: pinned},
 	}, nil
 }
 

@@ -741,6 +741,14 @@ file or stdin and takes the verifier settings of `attestation-verify/runnerclien
 verifier, see `attestation-verify/README.md`). `signer-admin import` does the same with
 the settings of each signer's connection file (`cloud.json`).
 
+The seal may happen offline too: `signer-admin identity` exports a verified
+IDENTITY (with the nonce, the verifier settings and the issuer key set the
+check needs) to a public file, `signer-admin seal` checks that file on the
+dealer machine without a network and seals the shares, and
+`signer-admin import -sealed` relays the sealed frames to the runner, which
+takes them as it takes any sealed import. The media between the two
+machines and the relaying machine hold ciphertext only.
+
 ### IMPORT_SHARES_SEALED
 
 ```

@@ -81,7 +81,7 @@ func (c *Client) ImportShareSealed(ctx context.Context, req backend.ImportShareR
 // are ignored.
 func (c *Client) ImportShareSealedWith(ctx context.Context, req backend.ImportShareRequest, sharePubkey backend.Pubkey,
 	verify remote.VerifyFunc, extra *backend.SealedImportRequest) (backend.ValidatorKey, error) {
-	id, err := c.verifiedIdentity(ctx, verify)
+	id, _, err := c.VerifiedIdentity(ctx, verify)
 	if err != nil {
 		return backend.ValidatorKey{}, err
 	}
@@ -96,24 +96,27 @@ func (c *Client) ImportShareSealedWith(ctx context.Context, req backend.ImportSh
 	return c.ImportSealed(ctx, sreq)
 }
 
-// verifiedIdentity is the runner's IDENTITY for a fresh nonce, checked by
-// verify: the import key to seal shares to.
-func (c *Client) verifiedIdentity(ctx context.Context, verify remote.VerifyFunc) (*backend.Identity, error) {
+// VerifiedIdentity is the runner's IDENTITY for a fresh nonce, checked by
+// verify: the import key to seal shares to, and the key an import of
+// offline-sealed shares compares the live runner's against. The returned
+// nonce is the one the attestation document binds, so a caller can export
+// both and check the identity again offline.
+func (c *Client) VerifiedIdentity(ctx context.Context, verify remote.VerifyFunc) (*backend.Identity, []byte, error) {
 	if verify == nil {
-		return nil, errors.New("remote: sealed import needs an attestation verifier")
+		return nil, nil, errors.New("remote: sealed import needs an attestation verifier")
 	}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	id, err := c.Identity(ctx, nonce)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := verify(ctx, nonce, id); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return id, nil
+	return id, nonce, nil
 }
 
 // BatchImport reports whether the runner takes IMPORT_SHARES_SEALED. It
@@ -140,26 +143,30 @@ func (c *Client) BatchImport(ctx context.Context) (bool, error) {
 // secret, which is not modified; Order and Sealed of reqs are ignored.
 func (c *Client) SealBatches(ctx context.Context, order []byte, reqs []backend.SealedImportRequest, secrets [][32]byte,
 	verify remote.VerifyFunc) ([][]backend.SealedImportRequest, error) {
-	id, err := c.verifiedIdentity(ctx, verify)
+	id, _, err := c.VerifiedIdentity(ctx, verify)
 	if err != nil {
 		return nil, err
 	}
-	var out [][]backend.SealedImportRequest
-	size := wire.MaxFrame // past the limit: the first share starts a batch
+	return SealBatchWithIdentity(id, order, reqs, secrets)
+}
+
+// SealBatchWithIdentity is SealBatches to id, an identity the caller
+// verified: it makes no network call, so it seals on an offline machine
+// too. reqs[i] carries share i's header and split, secrets[i] its secret,
+// which is not modified; Order and Sealed of reqs are ignored.
+func SealBatchWithIdentity(id *backend.Identity, order []byte, reqs []backend.SealedImportRequest,
+	secrets [][32]byte) ([][]backend.SealedImportRequest, error) {
 	for i := range reqs {
 		r := reqs[i]
 		r.Order = nil
-		if r.Sealed, err = sealedimport.Seal(id, &r, &secrets[i]); err != nil {
+		sealed, err := sealedimport.Seal(id, &r, &secrets[i])
+		if err != nil {
 			return nil, err
 		}
-		// The frame body holds 6 header bytes and the payload.
-		if n := wireadmin.BatchShareLen(&r); size+n > wire.MaxFrame-6 || len(out[len(out)-1]) == wireadmin.MaxBatch {
-			out, size = append(out, nil), wireadmin.BatchLen(order)
-		}
-		out[len(out)-1] = append(out[len(out)-1], r)
-		size += wireadmin.BatchShareLen(&r)
+		r.Sealed = sealed
+		reqs[i] = r
 	}
-	return out, nil
+	return wireadmin.ChunkBatch(order, reqs), nil
 }
 
 // ImportBatch sends one batch of SealBatches (IMPORT_SHARES_SEALED) and

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/lidofinance/tee-signer/attestation-verify"
 	"github.com/lidofinance/tee-signer/signer-protocol"
 )
 
@@ -19,6 +20,12 @@ type Option func(*Options)
 type Options struct {
 	Timeout time.Duration
 	HTTP    *http.Client
+	// KeySet is a pinned issuer key set (verify.WithKeySet): the
+	// azure-maa and gcp-cs verifiers use it as it is and never fetch one.
+	KeySet *attest.KeySet
+	// KeySetErr is the parse error of a WithKeySet that failed, so the
+	// verifier build refuses instead of silently fetching.
+	KeySetErr error
 	// NitroRoots replaces the pinned AWS root, for the tests of
 	// runnerclient and verify only (a local test CA); there is no exported
 	// way and no setting.

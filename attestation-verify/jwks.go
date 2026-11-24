@@ -286,10 +286,13 @@ func checkJWKSURI(issuer, jwksURI string) error {
 	return nil
 }
 
-// DiscoverJWKS reads issuer/.well-known/openid-configuration, checks that
-// it names the same issuer, and fetches the key set from its jwks_uri,
-// which must be on the issuer's host (checkJWKSURI).
-func DiscoverJWKS(ctx context.Context, client *http.Client, issuer string) (*KeySet, error) {
+// DiscoverJWKSBytes reads issuer/.well-known/openid-configuration, checks
+// that it names the same issuer, and fetches the key set from its
+// jwks_uri, which must be on the issuer's host (checkJWKSURI). It returns
+// the bytes of the key set file — the same thing a pinned JWKS file holds —
+// so a caller can export them with a verified identity and check that
+// identity again offline (verify.WithKeySet).
+func DiscoverJWKSBytes(ctx context.Context, client *http.Client, issuer string) ([]byte, error) {
 	issuer = strings.TrimSuffix(issuer, "/")
 	b, err := httpGet(ctx, client, issuer+"/.well-known/openid-configuration")
 	if err != nil {
@@ -308,5 +311,16 @@ func DiscoverJWKS(ctx context.Context, client *http.Client, issuer string) (*Key
 	if err := checkJWKSURI(issuer, cfg.JWKSURI); err != nil {
 		return nil, err
 	}
-	return FetchJWKS(ctx, client, cfg.JWKSURI)
+	return httpGet(ctx, client, cfg.JWKSURI)
+}
+
+// DiscoverJWKS reads issuer/.well-known/openid-configuration, checks that
+// it names the same issuer, and fetches the key set from its jwks_uri,
+// which must be on the issuer's host (checkJWKSURI).
+func DiscoverJWKS(ctx context.Context, client *http.Client, issuer string) (*KeySet, error) {
+	b, err := DiscoverJWKSBytes(ctx, client, issuer)
+	if err != nil {
+		return nil, err
+	}
+	return ParseJWKS(b)
 }

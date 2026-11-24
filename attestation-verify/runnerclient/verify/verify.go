@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/lidofinance/tee-signer/attestation-verify"
 	"github.com/lidofinance/tee-signer/attestation-verify/runnerclient/internal/optset"
 	"github.com/lidofinance/tee-signer/signer-protocol"
 )
@@ -165,6 +166,27 @@ type Option = optset.Option
 // not *http.Transport.
 func WithHTTPClient(c *http.Client) Option { return func(o *optset.Options) { o.HTTP = c } }
 
+// WithKeySet pins b, the bytes of an issuer key set file (the same thing
+// gcp_jwks_file holds; attest.DiscoverJWKSBytes fetches them), as the key
+// set of the azure-maa and gcp-cs verifiers: they use it as it is and never
+// fetch one, so an identity exported with its key set can be checked again
+// on an offline machine. b must parse (attest.ParseJWKS), which happens
+// when the option is applied. Not for the dev and aws-nitro verifiers
+// (they need no key set) and not together with gcp_jwks_file: pin one key
+// set.
+func WithKeySet(b []byte) Option {
+	return func(o *optset.Options) {
+		if o.KeySet != nil || o.KeySetErr != nil {
+			return // a WithKeySet before this one already ran
+		}
+		ks, err := attest.ParseJWKS(b)
+		if err == nil {
+			o.KeySet = ks
+		}
+		o.KeySetErr = err
+	}
+}
+
 // VerifyFunc checks an identity's attestation document. It is the type of
 // signer-protocol/remote.VerifyFunc, so a VerifyFunc goes to the remote
 // client as it is, and this package does not link the client.
@@ -221,6 +243,13 @@ func (a *Attestation) verifier(o *optset.Options) (VerifyFunc, error) {
 	case VerifierDev, VerifierAzureMAA, VerifierAWSNitro, VerifierGCPCS:
 	default:
 		return nil, fmt.Errorf("attestation.verifier: unknown verifier %q, want %s", a.Verifier, verifierList)
+	}
+	if err := o.KeySetErr; err != nil {
+		return nil, fmt.Errorf("attestation: pinned key set: %w", err)
+	}
+	if o.KeySet != nil && a.Verifier != VerifierAzureMAA && a.Verifier != VerifierGCPCS {
+		return nil, fmt.Errorf("attestation: a pinned key set is for %q or %q, not %q (it needs none)",
+			VerifierAzureMAA, VerifierGCPCS, a.Verifier)
 	}
 	if err := a.foreign(); err != nil {
 		return nil, err

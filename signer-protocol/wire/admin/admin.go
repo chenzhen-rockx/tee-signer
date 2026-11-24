@@ -245,6 +245,27 @@ func BatchShareLen(req *backend.SealedImportRequest) int {
 	return n
 }
 
+// ChunkBatch splits reqs into batches that each fit one
+// IMPORT_SHARES_SEALED frame under order: at most MaxBatch shares and
+// wire.MaxFrame body bytes. Each request's Order is ignored (the frame
+// carries the one order); Sealed is sealed bytes the caller made. An empty
+// reqs gives no batch.
+func ChunkBatch(order []byte, reqs []backend.SealedImportRequest) [][]backend.SealedImportRequest {
+	var out [][]backend.SealedImportRequest
+	size := wire.MaxFrame // past the limit: the first share starts a batch
+	for i := range reqs {
+		r := reqs[i]
+		r.Order = nil
+		// The frame body holds 6 header bytes and the payload.
+		if n := BatchShareLen(&r); size+n > wire.MaxFrame-6 || len(out[len(out)-1]) == MaxBatch {
+			out, size = append(out, nil), BatchLen(order)
+		}
+		out[len(out)-1] = append(out[len(out)-1], r)
+		size += BatchShareLen(&r)
+	}
+	return out
+}
+
 // EncodeImportBatch is IMPORT_SHARES_SEALED: version:u8 order_len:u32
 // order count:u16, then per share its header, sealed_len:u16 sealed and
 // t:u8, and if t > 0 n:u8 share_index:u8 commitments[48*t]. Every share

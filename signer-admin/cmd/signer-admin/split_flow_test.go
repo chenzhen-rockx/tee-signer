@@ -169,19 +169,34 @@ func splitDevRunners(t *testing.T, signerNames []string, tt int, signing []strin
 		t.Fatal(err)
 	}
 
-	for _, n := range signerNames {
+	for i, n := range signerNames {
 		body := filepath.Join(dir, n, "import.bin")
 		mustTool(t, "import-draft", "-cluster", cl, "-signer", n, "-split", splitPath, "-out", body)
 		mustTool(t, "show", body)
 		var sigs []string
-		for _, i := range []int{0, 2} {
-			mustTool(t, "sign", "-key", keys[i].file, "-expect-sha256", expectOf(t, body), body)
-			sigs = append(sigs, fmt.Sprintf("%s.%s.sig", body, keys[i].pub[2:10]))
+		for _, j := range []int{0, 2} {
+			mustTool(t, "sign", "-key", keys[j].file, "-expect-sha256", expectOf(t, body), body)
+			sigs = append(sigs, fmt.Sprintf("%s.%s.sig", body, keys[j].pub[2:10]))
 		}
 		signed := filepath.Join(dir, n, "import.signed")
 		mustTool(t, append([]string{"assemble", "-out", signed, body}, sigs...)...)
-		out := mustTool(t, "import", "-cluster", cl, "-signer", n, "-order", signed,
-			"-shares", filepath.Join(e.out, "shares", n, "shares.txt"), "-commitments", splitPath)
+		var out string
+		if i == 0 {
+			// The offline seal: the identity comes off this runner, the
+			// shares are sealed to it without a network, and the import
+			// relays the sealed file. The first signer goes this way, the
+			// rest the plaintext way.
+			ident := filepath.Join(dir, n, n+".identity.json")
+			mustTool(t, "identity", "-cluster", cl, "-signer", n, "-out", ident)
+			sealed := filepath.Join(dir, n, n+".sealed.json")
+			mustTool(t, "seal", "-identity", ident, "-shares", filepath.Join(e.out, "shares", n, "shares.txt"),
+				"-order", signed, "-split", splitPath, "-out", sealed)
+			out = mustTool(t, "import", "-cluster", cl, "-signer", n, "-order", signed,
+				"-commitments", splitPath, "-sealed", sealed)
+		} else {
+			out = mustTool(t, "import", "-cluster", cl, "-signer", n, "-order", signed,
+				"-shares", filepath.Join(e.out, "shares", n, "shares.txt"), "-commitments", splitPath)
+		}
 		t.Logf("import %s\n%s", n, out)
 		for _, pk := range e.pks {
 			wantIn(t, out, n+" imported "+pk.String())

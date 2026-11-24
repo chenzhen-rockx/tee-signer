@@ -567,6 +567,15 @@ identity with the verifier you name: `-verifier dev`, `-verifier azure-maa
 0=HEX -nitro-pcr 1=HEX -nitro-pcr 2=HEX` or `-verifier gcp-cs
 -gcp-image-digest sha256:HEX -gcp-audience NAME -gcp-hwmodel MODEL`.
 
+The seal may happen offline, on the dealer that split the keys:
+`signer-admin identity` exports a verified identity to a public file,
+`signer-admin seal` checks it there without a network (the file carries
+the verifier settings, and the issuer key set for azure-maa and gcp-cs)
+and seals the shares, and `signer-admin import -sealed` relays the sealed
+frames. Nothing runner-side changes: the sealed frames are what the
+online path sends, and the per-boot key still refuses a file sealed for
+another boot.
+
 ## Mutual TLS
 
 The client CA (from the setup, or `-tls-client-ca`) wraps every TCP and

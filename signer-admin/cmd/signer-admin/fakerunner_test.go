@@ -48,28 +48,47 @@ func newFakeClusterWith(t *testing.T, f runnerchain.Chain, timeLock int, lockedE
 	fc := &fakeCluster{dir: dir, keys: approvers(t, dir, 4), runners: map[string]*fakerunner.Runner{}}
 	conf := writeFile(t, filepath.Join(dir, "setup.conf"),
 		setupText(dir, caDER(t), genesisTime(), lockedText(fc.keys[:3], 2, timeLock, fee1)+lockedExtra, names...))
-	out := mustTool(t, "setup", "-out", filepath.Join(dir, "setups"), conf)
+	return fc.startCluster(t, conf, f)
+}
+
+// startCluster builds the setups of conf and starts one fake runner of
+// build f per signer, with the cloud.json and cluster.json files that name
+// them.
+func (fc *fakeCluster) startCluster(t *testing.T, conf string, f runnerchain.Chain) *fakeCluster {
+	t.Helper()
+	out := mustTool(t, "setup", "-out", filepath.Join(fc.dir, "setups"), conf)
 	fc.hashes = setupHashes(out)
 	if len(fc.hashes) != 3 || count(out, `^cluster_id 0x[0-9a-f]{64}$`) != 1 {
 		t.Fatalf("setup:\n%s", out)
 	}
 	var signers []map[string]string
 	for _, n := range names {
-		raw, err := os.ReadFile(filepath.Join(dir, "setups", n+".setup"))
+		raw, err := os.ReadFile(filepath.Join(fc.dir, "setups", n+".setup"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		r := fakerunner.StartSetupAs(t, raw, f)
 		fc.runners[n] = r
 		cert, key := r.ClientFiles(t, t.TempDir())
-		writeJSONFile(t, filepath.Join(dir, n, "cloud.json"), map[string]any{
+		writeJSONFile(t, filepath.Join(fc.dir, n, "cloud.json"), map[string]any{
 			"address": r.Addr(), "client_cert": cert, "client_key": key, "accounts": "accounts.json", "slots_per_epoch": 2,
 			"attestation": map[string]any{"verifier": "dev"},
 		})
 		signers = append(signers, map[string]string{"name": n, "cloud": n + "/cloud.json", "setup": "setups/" + n + ".setup"})
 	}
-	fc.cluster = writeJSONFile(t, filepath.Join(dir, "cluster.json"), map[string]any{"signers": signers})
+	fc.cluster = writeJSONFile(t, filepath.Join(fc.dir, "cluster.json"), map[string]any{"signers": signers})
 	return fc
+}
+
+// newFakeClusterMainnet is newFakeCluster with mainnet's exact chain
+// values in the setup, a prod chain.
+func newFakeClusterMainnet(t *testing.T) *fakeCluster {
+	t.Helper()
+	dir := t.TempDir()
+	fc := &fakeCluster{dir: dir, keys: approvers(t, dir, 4), runners: map[string]*fakerunner.Runner{}}
+	conf := writeFile(t, filepath.Join(dir, "setup.conf"),
+		mainnetChain(t, setupText(dir, caDER(t), genesisTime(), lockedText(fc.keys[:3], 2, int(setupwire.DefaultTimeLock), fee1), names...)))
+	return fc.startCluster(t, conf, runnerchain.Mainnet)
 }
 
 func (fc *fakeCluster) path(name string) string { return filepath.Join(fc.dir, name) }

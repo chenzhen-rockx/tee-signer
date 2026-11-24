@@ -238,6 +238,58 @@ func TestImportBatch(t *testing.T) {
 	}
 }
 
+// ChunkBatch splits to one frame each: every batch encodes, none holds
+// more than MaxBatch shares, and re-chunking what a batch decodes to
+// changes nothing.
+func TestChunkBatch(t *testing.T) {
+	order, reqs := batchSeed()
+	big := make([]backend.SealedImportRequest, MaxBatch+7)
+	for i := range big {
+		big[i] = reqs[i%len(reqs)]
+		big[i].Order = nil // ChunkBatch ignores Order
+	}
+	// No order is for a runner without a setup: no request may carry a
+	// split then.
+	noOrder := append([]backend.SealedImportRequest(nil), reqs...)
+	noOrder[0].T, noOrder[0].N, noOrder[0].ShareIndex, noOrder[0].Commitments = 0, 0, 0, nil
+	for _, tc := range []struct {
+		name  string
+		order []byte
+		reqs  []backend.SealedImportRequest
+	}{
+		{"two", order, reqs},
+		{"no share", order, nil},
+		{"no order", nil, noOrder},
+		{"over MaxBatch", order, big},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batches := ChunkBatch(tc.order, tc.reqs)
+			n := 0
+			for i, b := range batches {
+				if len(b) == 0 || len(b) > MaxBatch {
+					t.Fatalf("batch %d holds %d shares", i, len(b))
+				}
+				if len(b[0].Order) != 0 {
+					t.Fatalf("batch %d carries an order field", i)
+				}
+				if p, err := EncodeImportBatch(tc.order, b); err != nil {
+					t.Fatalf("batch %d does not encode: %v", i, err)
+				} else if len(p) > wire.MaxFrame {
+					t.Fatalf("batch %d is %d bytes, over the frame", i, len(p))
+				}
+				again := ChunkBatch(tc.order, b)
+				if len(again) != 1 || len(again[0]) != len(b) {
+					t.Fatalf("re-chunking batch %d split it", i)
+				}
+				n += len(b)
+			}
+			if n != len(tc.reqs) {
+				t.Fatalf("%d shares in %d batches, want %d", n, len(batches), len(tc.reqs))
+			}
+		})
+	}
+}
+
 func FuzzDecodeImportBatch(f *testing.F) {
 	order, reqs := batchSeed()
 	f.Add(must(EncodeImportBatch(order, reqs)))

@@ -554,7 +554,8 @@ func cmdImport(args []string, out io.Writer) error {
 	target := fs.String("signer", "", "the signer of cluster.json that takes the shares")
 	connPath := fs.String("conn", "", "in place of -cluster and -signer: the runner's connection file (cloud.json), for a runner outside a cluster.json")
 	orderPath := fs.String("order", "", "the signed import order (import.signed); a runner with a setup takes no share without one")
-	sharesPath := fs.String("shares", "", "the shares file: one share per line, mode 0600")
+	sharesPath := fs.String("shares", "", "the shares file: one share per line, mode 0600 (non-prod chains only)")
+	sealedPath := fs.String("sealed", "", "the sealed file of signer-admin seal: relayed as it is, no plaintext on this machine")
 	commPath := fs.String("commitments", "", "with -order: the split file of import-draft, for each validator's commitments")
 	skip := fs.Bool("skip-loaded", false, "leave out the shares whose validator the runner holds already")
 	icPath := fs.String("interchange", "", "EIP-3076 slashing protection file (format 5): each share goes in with its validator's maxima, so the runner refuses everything at or below them")
@@ -564,14 +565,17 @@ func cmdImport(args []string, out io.Writer) error {
 		return err
 	}
 	byCluster := *cf.path != "" || *target != ""
-	if fs.NArg() != 0 || *sharesPath == "" || byCluster == (*connPath != "") || byCluster && (*cf.path == "" || *target == "") ||
-		(*orderPath == "") != (*commPath == "") || *chainPath != "" && (byCluster || *icPath == "") {
+	if fs.NArg() != 0 || (*sharesPath == "") == (*sealedPath == "") || byCluster == (*connPath != "") || byCluster && (*cf.path == "" || *target == "") ||
+		(*orderPath == "") != (*commPath == "") || *chainPath != "" && (byCluster || *icPath == "") || (*sealedPath != "" && *icPath != "") {
 		return errors.New("usage: signer-admin import (-cluster cluster.json -signer NAME | -conn cloud.json [-setup FILE]) " +
-			"[-order import.signed -commitments FILE] -shares FILE [-interchange FILE] [-skip-loaded]")
+			"[-order import.signed -commitments FILE] (-shares FILE [-interchange FILE] | -sealed FILE) [-skip-loaded]")
 	}
-	// The shares file is plaintext: no core dumps from here on.
-	if err := lockSecrets(os.Stderr); err != nil {
-		return err
+	// The shares file is plaintext: no core dumps from here on. The sealed
+	// path never holds one.
+	if *sharesPath != "" {
+		if err := lockSecrets(os.Stderr); err != nil {
+			return err
+		}
 	}
 	var (
 		name  string
@@ -592,6 +596,10 @@ func cmdImport(args []string, out io.Writer) error {
 		m := c.members[0]
 		name, setup, clID = m.name, &m.setupHash, m.setup.ClusterID
 		gvr, gvrOfHash = cloud.Root(m.setup.Chain.GenesisValidatorsRoot), m.setupHash
+		if *sharesPath != "" && m.setup.Chain.Prod() {
+			return fmt.Errorf("%s signs for a prod chain, which takes no plaintext shares file: "+
+				"on the dealer run signer-admin seal and here import -sealed FILE (the encrypted path)", name)
+		}
 		dial = func() (*runnerclient.Client, error) { return connectAdmin(m, *cf.timeout) }
 	} else {
 		conn, err := loadConn(*connPath)
@@ -599,6 +607,10 @@ func cmdImport(args []string, out io.Writer) error {
 			return err
 		}
 		name = conn.Address
+		if *sharesPath != "" && conn.Attestation.Mainnet {
+			return fmt.Errorf("%s signs for mainnet, which takes no plaintext shares file: "+
+				"on the dealer run signer-admin seal and here import -sealed FILE (the encrypted path)", name)
+		}
 		if *icPath != "" {
 			if *chainPath == "" {
 				return errors.New("-conn with -interchange needs -setup: the runner's setup file, or its -config file if it runs without a setup")
@@ -612,6 +624,10 @@ func cmdImport(args []string, out io.Writer) error {
 			if s != nil {
 				if err := devPlatformOnly(conn, s); err != nil {
 					return fmt.Errorf("%s: %w", *connPath, err)
+				}
+				if *sharesPath != "" && s.Chain.Prod() {
+					return fmt.Errorf("%s signs for a prod chain, which takes no plaintext shares file: "+
+						"on the dealer run signer-admin seal and here import -sealed FILE (the encrypted path)", name)
 				}
 			}
 		}
@@ -641,7 +657,20 @@ func cmdImport(args []string, out io.Writer) error {
 		}
 	}
 	var ic *interchange
-	if *icPath != "" {
+	var sealed *sealedFile
+	var frames [][]cloud.SealedImportRequest
+	if *sealedPath != "" {
+		if sealed, err = readSealedFile(*sealedPath); err != nil {
+			return err
+		}
+		// Everything the file claims is checked against the order and the
+		// split before the runner is dialed: a wrong file is refused with
+		// nothing sent.
+		if frames, err = checkSealed(sealed, name, raw, o, split, *commPath); err != nil {
+			return fmt.Errorf("%s: %w", *sealedPath, err)
+		}
+	}
+	if *sharesPath != "" && *icPath != "" {
 		if ic, err = loadInterchange(*icPath); err != nil {
 			return err
 		}
@@ -652,18 +681,21 @@ func cmdImport(args []string, out io.Writer) error {
 			return fmt.Errorf("%s: genesis_validators_root %s is not the runner's chain %s (refusing)", *icPath, ic.gvr, gvr)
 		}
 	}
-	shares, err := readShares(*sharesPath)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		for i := range shares {
-			clear(shares[i].secret[:])
-		}
-	}()
-	if o != nil {
-		if err := checkShareIndex(*sharesPath, shares, split, o); err != nil {
+	var shares []share
+	if *sharesPath != "" {
+		var err error
+		if shares, err = readShares(*sharesPath); err != nil {
 			return err
+		}
+		defer func() {
+			for i := range shares {
+				clear(shares[i].secret[:])
+			}
+		}()
+		if o != nil {
+			if err := checkShareIndex(*sharesPath, shares, split, o); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -683,6 +715,24 @@ func cmdImport(args []string, out io.Writer) error {
 	if !r.OK() {
 		return fmt.Errorf("%s: %s", name, r)
 	}
+	held := map[cloud.Pubkey]bool{}
+	if *skip {
+		ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
+		keys, err := cl.PublicKeys(ctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%s: public keys: %w", name, err)
+		}
+		for _, k := range keys {
+			held[k.Pubkey] = true
+		}
+	}
+	if sealed != nil {
+		// Nothing here reads a plaintext share: the sealed file is relayed
+		// as it is, after the live runner is checked to be the boot it was
+		// sealed for.
+		return relaySealed(out, name, cl, *cf.timeout, sealed, frames, held)
+	}
 	if ic != nil {
 		// The chain compared above is the runner's only if the runner runs
 		// the setup or -config file it came from.
@@ -695,18 +745,6 @@ func cmdImport(args []string, out io.Writer) error {
 		if st.SetupHash != gvrOfHash {
 			return fmt.Errorf("%s: the runner reports setup %s, the chain of the interchange check is that of %s (refusing)",
 				name, fullHex(st.SetupHash), fullHex(gvrOfHash))
-		}
-	}
-	held := map[cloud.Pubkey]bool{}
-	if *skip {
-		ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
-		keys, err := cl.PublicKeys(ctx)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("%s: public keys: %w", name, err)
-		}
-		for _, k := range keys {
-			held[k.Pubkey] = true
 		}
 	}
 	ac := remoteadmin.Wrap(cl.Client)
@@ -806,6 +844,13 @@ func importBatches(ac *remoteadmin.Client, cl *runnerclient.Client, order []byte
 	if err != nil {
 		return 0, fmt.Errorf("seal the shares: %w", err)
 	}
+	return sendBatches(ac, order, batches, len(batch), timeout, out, name, list)
+}
+
+// sendBatches sends pre-sealed batches (SealBatches or an offline seal)
+// and reports how many shares the runner took.
+func sendBatches(ac *remoteadmin.Client, order []byte, batches [][]cloud.SealedImportRequest, total int,
+	timeout time.Duration, out io.Writer, name string, list bool) (int, error) {
 	done := 0
 	for i, b := range batches {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -813,7 +858,7 @@ func importBatches(ac *remoteadmin.Client, cl *runnerclient.Client, order []byte
 		cancel()
 		if err != nil {
 			return done, fmt.Errorf("batch %d of %d (%d shares, from %s) refused, it and the %d shares after it are not imported: %w",
-				i+1, len(batches), len(b), b[0].Pubkey, len(batch)-done-len(b), err)
+				i+1, len(batches), len(b), b[0].Pubkey, total-done-len(b), err)
 		}
 		for _, k := range keys {
 			if list {

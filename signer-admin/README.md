@@ -6,7 +6,7 @@
 
 Operator tools, outside the TEE: `signer-admin` (drafts and signs setup updates and orders, `approver` and its agents), `cluster` (setups of a signer group), the admin client (`remote/admin`), and the key lifecycle tools: `share-import`, `setup-tool`, `identity-check` and `proof-check`. `fakerunner` is a test runner for the tools.
 
-The runner checks everything these tools send. None of them holds a validator key, except `signer-admin split`, the offline dealer of [Splitting existing keys](#splitting-existing-keys).
+The runner checks everything these tools send. None of them holds a validator key, except `signer-admin split`, the offline dealer of [Splitting existing keys](#splitting-existing-keys), and `signer-admin seal`, which runs beside it and seals the split shares to a runner's attested import key offline.
 
 `signer-admin exit` signs a voluntary exit. Only the admin role may sign one, so the signing client cannot. It sends the exit to the signers of `cluster.json` in turn with each signer's admin connection file, keeps the first t partial signatures that verify under their share keys (t and the share indices come from the split file of `import-draft`; a cluster of one single-mode signer needs none), combines them, checks the result under the validator key and writes the beacon API body. It posts nothing. To broadcast:
 
@@ -65,13 +65,15 @@ split checks each keystore's checksum and that the secret gives the keystore's p
 - `OUT/shares/NAME/shares.txt`: the signer's share of each key, mode 0600. Secret.
 - `OUT/manifest.json`: t, n, the share indices, every share pubkey and the sha256 of `split.json`. Public.
 
-Any t of the `shares.txt` files are the whole keys, so they never travel together and never sit on an online machine longer than one import. Per signer NAME, one at a time:
+Any t of the `shares.txt` files are the whole keys, so they never travel together and never leave the dealer machine as plaintext. Per signer NAME, one at a time:
 
 1. `signer-admin import-draft -cluster cluster.json -signer NAME -split OUT/split.json -out import.bin` (the split file is public; copy it off the dealer machine with the manifest).
 2. The approvers check it with `signer-admin show` and sign it with `signer-admin sign -expect-sha256 HEX`, where HEX is the direct form's sha256 that `show` printed.
 3. `signer-admin assemble -out import.signed import.bin SIG...`
-4. On the dealer machine, copy only `OUT/shares/NAME/shares.txt` to removable media, nothing else of `OUT/shares`. Shares leave the dealer in plaintext only here, one signer's file at a time; signer-admin seals online only, to the runner's per-boot import key.
-5. On the machine that runs `import` for NAME (it needs the admin connection and the network), copy the file from the media into a new tmpfs folder (`mount -t tmpfs none DIR`), mode 0600, and run `signer-admin import -cluster cluster.json -signer NAME -order import.signed -shares DIR/shares.txt -commitments split.json`. `import` refuses a file whose shares are not the order's share index, before it sends anything, so a wrong NAME stops here. It also turns core dumps off; keep swap off on this machine too.
-6. Right after the import succeeds, delete the file: `umount DIR` for the tmpfs folder, and `shred -u` the copy on the media (shred overwrites in place, which works on a plain filesystem on a flash stick or a hard disk; an SSD or a journaling or copy-on-write filesystem may keep old blocks, so treat such media as still holding the share and keep or destroy it as a secret).
+4. On a machine with the network and the admin connection, run `signer-admin identity -cluster cluster.json -signer NAME -out NAME.identity.json`: it fetches the runner's IDENTITY with a fresh nonce, checks it with the signer's verifier settings, and writes the attested import key with those settings to a public file. Copy that file to the dealer media; nothing in it is secret.
+5. On the dealer machine, run `signer-admin seal -identity NAME.identity.json -shares OUT/shares/NAME/shares.txt -order import.signed -split OUT/split.json -out NAME.sealed.json` (add `-interchange ic.json` to bake each validator's slashing-protection maxima in). Offline it checks the identity file's attestation document with the settings it carries, checks the shares against the order and the split as `import` does, and seals each share to the runner's per-boot import key. Copy only `NAME.sealed.json` back to the media: the shares leave the dealer as ciphertext, sealed to one runner boot.
+6. On the machine that runs `import` for NAME (it needs the admin connection and the network), run `signer-admin import -cluster cluster.json -signer NAME -order import.signed -commitments OUT/split.json -sealed NAME.sealed.json`. The command relays the file as it is and never reads a share: first it checks the live runner's import key against the one the file was sealed to — a runner that restarted since the seal is refused with nothing sent, and the fix is to run `identity` here and `seal` on the dealer again (the shares never left the dealer) — then it sends the sealed frames. `-order` and `-commitments` are optional cross-checks of the file's fingerprints.
+
+The plaintext shares stay on the dealer's tmpfs until `OUT` is deleted after the last signer. The media hold ciphertext and public files only, so wiping them after the import is hygiene, not secret handling. For non-prod chains the plaintext path remains: `signer-admin import -shares FILE` on a tmpfs copy (mode 0600) seals the shares online as before; a prod-chain runner refuses it.
 
 After the last signer, delete `OUT` on the dealer machine (`umount` its tmpfs) and do not reboot into a hibernation image that was made while it existed.
