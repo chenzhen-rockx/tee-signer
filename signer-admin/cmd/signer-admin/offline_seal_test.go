@@ -1,14 +1,22 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/lidofinance/tee-signer/governance/importorder"
+	remoteadmin "github.com/lidofinance/tee-signer/signer-admin/remote/admin"
 	"github.com/lidofinance/tee-signer/signer-core/core"
+	"github.com/lidofinance/tee-signer/signer-core/software"
 	"github.com/lidofinance/tee-signer/signer-core/threshold"
+	cloud "github.com/lidofinance/tee-signer/signer-protocol"
 	"github.com/lidofinance/tee-signer/signer-protocol/wire"
 	wireadmin "github.com/lidofinance/tee-signer/signer-protocol/wire/admin"
 )
@@ -92,8 +100,9 @@ func TestOfflineSealRelay(t *testing.T) {
 
 // seal refuses the identity of another signer before it reads the shares:
 // the order names s2's setup, the identity is s3's. The relay refuses a
-// file sealed for another signer, an order it was not sealed for, and
-// -interchange with -sealed.
+// file sealed for another signer and -interchange with -sealed; a file
+// goes under another order than the one it was sealed for when that order
+// takes every share of it, and says so.
 func TestOfflineSealRefusals(t *testing.T) {
 	fc := newFakeCluster(t)
 	_, signed, splitPath, sharesFile := offlineTrack(t, fc)
@@ -136,14 +145,19 @@ func TestOfflineSealRefusals(t *testing.T) {
 	out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s3", "-order", signed, "-commitments", splitPath, "-sealed", sealed)
 	wantIn(t, out, "is an import order for setup", "s3 runs setup")
 	// Another order: the same split drafted with another not_after, so
-	// another hash.
+	// another hash. It takes every share of the file, which goes under it;
+	// the relay says which order it used.
 	body2 := fc.path("import2.bin")
 	mustTool(t, "import-draft", "-cluster", fc.cluster, "-signer", "s2", "-split", splitPath, "-not-after", "6h", "-out", body2)
 	sigs2 := fc.signAll(t, body2, 0, 1)
 	signed2 := fc.path("import2.signed")
 	mustTool(t, "assemble", "-out", signed2, body2, sigs2[0], sigs2[1])
-	out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed2, "-commitments", splitPath, "-sealed", sealed)
-	wantIn(t, out, "sealed for order", "the relay's order is")
+	out = mustTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed2, "-commitments", splitPath, "-sealed", sealed)
+	wantIn(t, out, "NOTICE s2: sealed for order "+fullHex(sha256.Sum256(mustRead(t, signed)))+
+		", relayed under order "+fullHex(sha256.Sum256(mustRead(t, signed2))), "s2: relayed 1 sealed shares")
+	if keys := fc.runners["s2"].Keys(); len(keys) != 1 {
+		t.Fatalf("runner holds %d keys, want 1", len(keys))
+	}
 	// -interchange belongs to seal, not to the relay.
 	out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed, "-commitments", splitPath,
 		"-sealed", sealed, "-interchange", fc.path("ic.json"))
@@ -286,4 +300,307 @@ func TestOfflineSealInterchange(t *testing.T) {
 	// And the relay takes it.
 	out = mustTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed, "-commitments", splitPath, "-sealed", sealed)
 	wantIn(t, out, "s2: relayed 1 sealed shares")
+}
+
+// secondSplit splits another key as the order track's split (the same t
+// and n) into dir, and writes s2's shares file of it in the 4-field form
+// of split. It returns the key, the split file and the shares file.
+func secondSplit(t *testing.T, fc *fakeCluster, dir string) (key, splitPath, sharesFile string) {
+	t.Helper()
+	k, shares, splitPath := split(t, dir, 3, 4, []string{"s1", "s2", "s3", "s4"})
+	sharePub, err := core.PubkeyOf(shares[1].Secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharesFile = fc.path("s2-shares-" + filepath.Base(dir) + ".txt")
+	if err := os.WriteFile(sharesFile, fmt.Appendf(nil, "0x%x %s 2 %s\n", shares[1].Secret, k.String(), sharePub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return k.String(), splitPath, sharesFile
+}
+
+// orderFor drafts the order of splitPath for s2 and assembles it signed by
+// two approvers.
+func orderFor(t *testing.T, fc *fakeCluster, name, splitPath string) string {
+	t.Helper()
+	body := fc.path(name + ".bin")
+	mustTool(t, "import-draft", "-cluster", fc.cluster, "-signer", "s2", "-split", splitPath, "-out", body)
+	signed := fc.path(name + ".signed")
+	mustTool(t, append([]string{"assemble", "-out", signed, body}, fc.signAll(t, body, 0, 1)...)...)
+	return signed
+}
+
+// seal without -order seals the shares for the signer's share index of the
+// split, and the file waits for its order: import -sealed attaches the
+// order the approvers signed for the split, in a batch and one by one.
+// With no order named, with another split file, or with an order of
+// another split, nothing is sent.
+func TestSealWithoutOrder(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprint("batch ", batch), func(t *testing.T) {
+			fc := newFakeCluster(t)
+			if batch {
+				fc.runners["s2"].ServeBatch()
+			}
+			mustTool(t, "pin", "-cluster", fc.cluster) // import-draft reads the locked values in force
+			key, shares, splitPath := split(t, fc.dir, 3, 4, []string{"s1", "s2", "s3", "s4"})
+			sharePub, err := core.PubkeyOf(shares[1].Secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sharesFile := fc.path("s2-shares.txt")
+			if err := os.WriteFile(sharesFile, fmt.Appendf(nil, "0x%x %s 2 %s\n", shares[1].Secret, key.String(), sharePub), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ident := fc.path("s2.identity.json")
+			mustTool(t, "identity", "-cluster", fc.cluster, "-signer", "s2", "-out", ident)
+			sealed := fc.path("s2.sealed.json")
+			out := mustTool(t, "seal", "-identity", ident, "-shares", sharesFile, "-split", splitPath, "-out", sealed)
+			wantIn(t, out, "sealed 1 shares of s2 (verifier dev)", "3 of 4, share index 2, no import order yet", "wrote "+sealed)
+
+			// The file names the split and no order; its frame carries the
+			// share without an order and without the split.
+			var sf sealedFile
+			if err := readStrictJSON(sealed, &sf); err != nil {
+				t.Fatal(err)
+			}
+			if sf.OrderSHA256 != "" || sf.SplitSHA256 != fullHex(sha256.Sum256(mustRead(t, splitPath))) || sf.T != 3 || sf.N != 4 || sf.ShareIndex != 2 {
+				t.Fatalf("the file names order %q, split %s, %d of %d, share index %d; want no order, the split's hash, 3 of 4, index 2",
+					sf.OrderSHA256, sf.SplitSHA256, sf.T, sf.N, sf.ShareIndex)
+			}
+			reqs, err := wireadmin.DecodeImportBatch(sf.Frames[0])
+			if err != nil || len(reqs) != 1 {
+				t.Fatalf("frame: %v, %d shares", err, len(reqs))
+			}
+			if reqs[0].T != 0 || len(reqs[0].Order) != 0 || len(reqs[0].Commitments) != 0 {
+				t.Fatalf("the frame carries a split or an order: t %d, %d order bytes, %d commitments",
+					reqs[0].T, len(reqs[0].Order), len(reqs[0].Commitments))
+			}
+
+			r := fc.runners["s2"]
+			sent := func() int { return r.Seen(wireadmin.TypeImportBatch) + r.Seen(wireadmin.TypeImportSealed) }
+			before := sent()
+			out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-sealed", sealed)
+			wantIn(t, out, "sealed without an import order", "-order", "-commitments")
+			// Another split file than the one the shares were sealed for.
+			_, split2, _ := secondSplit(t, fc, fc.path("other"))
+			signed2 := orderFor(t, fc, "import-other", split2)
+			out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed2, "-commitments", split2, "-sealed", sealed)
+			wantIn(t, out, "sealed for split", split2)
+			// An order of another split: the same t, n and share index.
+			out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed2, "-commitments", splitPath, "-sealed", sealed)
+			wantIn(t, out, "does not name validator "+key.String(), "import-draft -split", "nothing sent")
+			if sent() != before {
+				t.Fatalf("the relay sent %d frames of a file without an order that takes it", sent()-before)
+			}
+
+			// The order of the split takes the shares: attached, and the
+			// runner holds the share of index 2.
+			signed := orderFor(t, fc, "import", splitPath)
+			out = mustTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed, "-commitments", splitPath, "-sealed", sealed)
+			wantIn(t, out, "s2: relayed 1 sealed shares, skipped 0 held already")
+			if strings.Contains(out, "NOTICE") {
+				t.Fatalf("the relay reports another order than the file's:\n%s", out)
+			}
+			keys := r.Keys()
+			if len(keys) != 1 || keys[0].Pubkey.String() != key.String() || keys[0].SharePubkey != sharePub {
+				t.Fatalf("runner holds %v; want share 2 of %s", keys, key)
+			}
+		})
+	}
+}
+
+// seal with neither -order nor -split is the seal for a runner without a
+// setup, as before: the file names no order, no split and no share index,
+// and the relay sends it as it is.
+func TestSealWithoutOrderOrSplit(t *testing.T) {
+	fc := newFakeCluster(t)
+	_, _, _, sharesFile := offlineTrack(t, fc)
+	ident := fc.path("s2.identity.json")
+	mustTool(t, "identity", "-cluster", fc.cluster, "-signer", "s2", "-out", ident)
+	sealed := fc.path("s2.sealed.json")
+	out := mustTool(t, "seal", "-identity", ident, "-shares", sharesFile, "-out", sealed)
+	wantIn(t, out, "sealed 1 shares of s2 (verifier dev)", "wrote "+sealed)
+	var sf sealedFile
+	if err := readStrictJSON(sealed, &sf); err != nil {
+		t.Fatal(err)
+	}
+	if sf.OrderSHA256 != "" || sf.SplitSHA256 != "" || sf.T != 0 || sf.N != 0 || sf.ShareIndex != 0 {
+		t.Fatalf("the file names an order, a split or a share index: order %q, split %q, %d of %d, index %d",
+			sf.OrderSHA256, sf.SplitSHA256, sf.T, sf.N, sf.ShareIndex)
+	}
+	out = mustTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-sealed", sealed)
+	wantIn(t, out, "s2: relayed 1 sealed shares")
+}
+
+// seal with -order refuses an order that does not take the shares, with
+// nothing written: one drafted from another split of another key, and one
+// drafted from another split of the same key. Both have the t, n and share
+// index of the order, which is all the seal compared before.
+func TestSealOrderOfAnotherSplit(t *testing.T) {
+	fc := newFakeCluster(t)
+	_, signed, _, _ := offlineTrack(t, fc)
+	ident := fc.path("s2.identity.json")
+	mustTool(t, "identity", "-cluster", fc.cluster, "-signer", "s2", "-out", ident)
+	sealed := fc.path("s2.sealed.json")
+
+	// Another key, split the same way.
+	_, split2, shares2 := secondSplit(t, fc, fc.path("other"))
+	out := failTool(t, "seal", "-identity", ident, "-shares", shares2, "-order", signed, "-split", split2, "-out", sealed)
+	wantIn(t, out, "the import order does not name validator", "not sealed", signed+" does not go with "+split2, "import-draft -split")
+	if _, err := os.Stat(sealed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seal wrote %s, shares its order does not take", sealed)
+	}
+
+	// The same key, split again: the order names the validator, with the
+	// commitments of the first split.
+	sk, err := software.NewSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, err := core.PubkeyOf(sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, first, err := software.SplitWithCommitments(sk, 3, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, second, err := software.SplitWithCommitments(sk, 3, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(sk[:])
+	write := func(dir string, comm []cloud.Pubkey) string {
+		t.Helper()
+		return writeJSONFile(t, filepath.Join(dir, "split.json"), map[string]any{
+			"t": 3, "n": 4, "shares": map[string]int{"s1": 1, "s2": 2, "s3": 3, "s4": 4},
+			"validators": []any{map[string]any{"pubkey": pk, "commitments": comm}},
+		})
+	}
+	splitA, splitB := write(fc.path("first"), first), write(fc.path("second"), second)
+	signedA := orderFor(t, fc, "import-first", splitA)
+	sharePub, err := core.PubkeyOf(again[1].Secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharesAgain := fc.path("s2-shares-again.txt")
+	if err := os.WriteFile(sharesAgain, fmt.Appendf(nil, "0x%x %s 2 %s\n", again[1].Secret, pk.String(), sharePub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out = failTool(t, "seal", "-identity", ident, "-shares", sharesAgain, "-order", signedA, "-split", splitB, "-out", sealed)
+	wantIn(t, out, "names "+pk.String()+" with the commitments_sha256", "not sealed", "import-draft -split")
+	if _, err := os.Stat(sealed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seal wrote %s, shares of another split of the key", sealed)
+	}
+}
+
+// sealUnchecked writes the sealed file seal wrote before it checked that
+// the order takes every share: the shares and the split given, sealed
+// under the order whatever it names. It makes the file of a seal of an
+// earlier build.
+func sealUnchecked(t *testing.T, ident, orderPath, sharesPath, splitPath, out string) {
+	t.Helper()
+	f, err := readIdentityFile(ident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.check(); err != nil {
+		t.Fatal(err)
+	}
+	id, err := f.identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := mustRead(t, orderPath)
+	o, err := importorder.Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	split, err := readSplit(splitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shares, err := readShares(sharesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		reqs    []cloud.SealedImportRequest
+		secrets [][32]byte
+	)
+	for i := range shares {
+		s := &shares[i]
+		sp, err := core.PubkeyOf(s.secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		comm, _ := split.commitmentsOf(s.pubkey)
+		reqs = append(reqs, cloud.SealedImportRequest{Pubkey: s.pubkey, SharePubkey: sp, Index: s.index,
+			Order: raw, T: o.Body.T, N: o.Body.N, ShareIndex: o.Body.ShareIndex, Commitments: comm})
+		secrets = append(secrets, s.secret)
+	}
+	batches, err := remoteadmin.SealBatchWithIdentity(id, raw, reqs, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf := &sealedFile{
+		Version: 1, Signer: f.Signer, SealedAt: time.Now().UTC().Format(time.RFC3339),
+		Identity: sealedIdentity{
+			ImportKeySHA256: fullHex(sha256.Sum256(id.ImportKey)),
+			TLSKeySHA256:    fullHex(sha256.Sum256(id.TLSKeyHash)),
+			Verifier:        f.Attestation.Verifier,
+			SetupSHA256:     fullHex(id.State.SetupHash),
+		},
+		OrderSHA256: fullHex(sha256.Sum256(raw)),
+		SplitSHA256: fullHex(sha256.Sum256(mustRead(t, splitPath))),
+		T:           o.Body.T, N: o.Body.N, ShareIndex: o.Body.ShareIndex,
+	}
+	for _, b := range batches {
+		p, err := wireadmin.EncodeImportBatch(raw, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sf.Frames = append(sf.Frames, p)
+	}
+	fileJSON, err := marshalFile(sf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, fileJSON, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A file sealed under an order of another split (what a seal of an earlier
+// build wrote once the t, n and share index matched) is refused at the
+// relay with nothing sent, under the order it was sealed for and without
+// one. The order of the split takes the shares: the file goes under it,
+// and the relay says which order it used, so the shares need no new seal.
+func TestRelayOrderOfAnotherSplit(t *testing.T) {
+	fc := newFakeCluster(t)
+	_, signed, _, _ := offlineTrack(t, fc)
+	key2, split2, shares2 := secondSplit(t, fc, fc.path("other"))
+	ident := fc.path("s2.identity.json")
+	mustTool(t, "identity", "-cluster", fc.cluster, "-signer", "s2", "-out", ident)
+	sealed := fc.path("s2.sealed.json")
+	sealUnchecked(t, ident, signed, shares2, split2, sealed)
+
+	r := fc.runners["s2"]
+	out := failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed, "-commitments", split2, "-sealed", sealed)
+	wantIn(t, out, "does not name validator "+key2, "import-draft -split", "nothing sent")
+	out = failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-sealed", sealed)
+	wantIn(t, out, "does not name validator "+key2, "nothing sent")
+	if r.Seen(wireadmin.TypeImportBatch) != 0 || r.Seen(wireadmin.TypeImportSealed) != 0 || len(r.Keys()) != 0 {
+		t.Fatal("the relay sent shares of a file under an order that does not take them")
+	}
+
+	signed2 := orderFor(t, fc, "import-other", split2)
+	out = mustTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed2, "-commitments", split2, "-sealed", sealed)
+	wantIn(t, out, "NOTICE s2: sealed for order "+fullHex(sha256.Sum256(mustRead(t, signed)))+
+		", relayed under order "+fullHex(sha256.Sum256(mustRead(t, signed2))), "s2: relayed 1 sealed shares")
+	keys := r.Keys()
+	if len(keys) != 1 || keys[0].Pubkey.String() != key2 {
+		t.Fatalf("runner holds %v, want share 2 of %s", keys, key2)
+	}
 }

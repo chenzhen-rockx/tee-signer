@@ -16,6 +16,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lidofinance/tee-signer/attestation-verify/runnerclient"
@@ -488,13 +489,13 @@ func readShares(path string) ([]share, error) {
 	return out, nil
 }
 
-// checkShareIndex refuses the shares of another signer: under an import
-// order, every share that the split file knows must be the share of the
-// order's index, the public key of the commitments at that index. It runs
-// before the runner is dialed, so a wrong file is refused with nothing
-// sealed and nothing sent. The runner makes the same check inside the
-// TEE; this one keeps the share out of it.
-func checkShareIndex(sharesPath string, shares []share, split *splitFile, o *importorder.Order) error {
+// checkShareIndex refuses the shares of another signer: every share that
+// the split file knows must be the share of index, the public key of the
+// commitments at that index (the order's index under an order, the
+// signer's own without one). It runs before anything is sealed or sent, so
+// a wrong file is refused with nothing sealed and nothing sent. The runner
+// makes the same check inside the TEE; this one keeps the share out of it.
+func checkShareIndex(sharesPath string, shares []share, split *splitFile, index uint8) error {
 	for i := range shares {
 		s := &shares[i]
 		comm, ok := split.commitmentsOf(s.pubkey)
@@ -505,7 +506,7 @@ func checkShareIndex(sharesPath string, shares []share, split *splitFile, o *imp
 		if err != nil {
 			continue // reported in the import loop
 		}
-		want, err := threshold.FeldmanEval(comm, uint64(o.Body.ShareIndex))
+		want, err := threshold.FeldmanEval(comm, uint64(index))
 		if err != nil {
 			return fmt.Errorf("commitments of %s: %w", s.pubkey, err)
 		}
@@ -513,16 +514,57 @@ func checkShareIndex(sharesPath string, shares []share, split *splitFile, o *imp
 			continue
 		}
 		which := "not a share"
-		for x := 1; x <= int(o.Body.N); x++ {
+		for x := 1; x <= int(split.N); x++ {
 			if p, err := threshold.FeldmanEval(comm, uint64(x)); err == nil && p == sp {
 				which = fmt.Sprintf("share %d", x)
 				break
 			}
 		}
-		return fmt.Errorf("%s:%d is %s of validator %s, the order is for share index %d; nothing sent",
-			sharesPath, s.line, which, s.pubkey, o.Body.ShareIndex)
+		return fmt.Errorf("%s:%d is %s of validator %s, want share index %d; nothing sent",
+			sharesPath, s.line, which, s.pubkey, index)
 	}
 	return nil
+}
+
+// orderOtherSplit is the way out when an import order does not take the
+// shares it is used with (checkOrderShare).
+const orderOtherSplit = "an import order is drafted from one split file (import-draft -split) and names the validators of that split, " +
+	"so this order is of another split: draft, sign and assemble the orders from the split file of these shares"
+
+// checkOrderShare refuses a share that the runner refuses under this order,
+// before anything is sealed or sent: the order must name the share's
+// validator (importorder.Body.Matches) with the commitments hash of the
+// split's commitments for it (the runner's split check). An order of
+// another split passes the other checks of seal and import when its t, n
+// and share index are the same, so without this one its shares travel to
+// the dealer and back, and come back from the runner as "import order:
+// does not name validator".
+func checkOrderShare(o *importorder.Body, r *cloud.SealedImportRequest) error {
+	for i := range o.Validators {
+		e := &o.Validators[i]
+		if e.Pubkey != r.Pubkey {
+			continue
+		}
+		if h := importorder.CommitmentsHash(r.Commitments); h != e.CommitmentsHash {
+			return fmt.Errorf("the import order names %s with the commitments_sha256 %s, the split file's commitments hash is %s",
+				r.Pubkey, hex8(e.CommitmentsHash), hex8(h))
+		}
+		return nil
+	}
+	return fmt.Errorf("the import order does not name validator %s; it names %s", r.Pubkey, namedValidators(o))
+}
+
+// namedValidators is what an order names, for a refusal: its validators
+// when there are few, else their number.
+func namedValidators(o *importorder.Body) string {
+	if len(o.Validators) > 3 {
+		return fmt.Sprintf("%d validators", len(o.Validators))
+	}
+	pks := make([]string, len(o.Validators))
+	for i := range o.Validators {
+		pks[i] = o.Validators[i].Pubkey.String()
+	}
+	return fmt.Sprintf("%d validator(s): %s", len(pks), strings.Join(pks, ", "))
 }
 
 // chainOf reads a runner's setup file, or the -config file of a runner
@@ -666,8 +708,12 @@ func cmdImport(args []string, out io.Writer) error {
 		// Everything the file claims is checked against the order and the
 		// split before the runner is dialed: a wrong file is refused with
 		// nothing sent.
-		if frames, err = checkSealed(sealed, name, raw, o, split, *commPath); err != nil {
+		var notice string
+		if frames, notice, err = checkSealed(sealed, name, raw, o, split, *commPath); err != nil {
 			return fmt.Errorf("%s: %w", *sealedPath, err)
+		}
+		if notice != "" {
+			fprintf(out, "NOTICE %s: %s; that order takes every share of the file\n", name, notice)
 		}
 	}
 	if *sharesPath != "" && *icPath != "" {
@@ -693,7 +739,7 @@ func cmdImport(args []string, out io.Writer) error {
 			}
 		}()
 		if o != nil {
-			if err := checkShareIndex(*sharesPath, shares, split, o); err != nil {
+			if err := checkShareIndex(*sharesPath, shares, split, o.Body.ShareIndex); err != nil {
 				return err
 			}
 		}

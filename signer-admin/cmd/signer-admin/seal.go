@@ -26,6 +26,7 @@ import (
 	"github.com/lidofinance/tee-signer/governance/importorder"
 	remoteadmin "github.com/lidofinance/tee-signer/signer-admin/remote/admin"
 	"github.com/lidofinance/tee-signer/signer-core/core"
+	"github.com/lidofinance/tee-signer/signer-core/threshold"
 	cloud "github.com/lidofinance/tee-signer/signer-protocol"
 	wireadmin "github.com/lidofinance/tee-signer/signer-protocol/wire/admin"
 )
@@ -40,16 +41,21 @@ type sealedFile struct {
 	Signer   string         `json:"signer"`
 	SealedAt string         `json:"sealed_at"`
 	Identity sealedIdentity `json:"identity"`
-	// OrderSHA256 and SplitSHA256, 64 hex digits, are of the signed order
-	// and the split file the shares were sealed under; both omitted when
-	// sealed without an order (a runner without a setup).
+	// SplitSHA256, 64 hex digits, is of the split file the shares were
+	// sealed under, and T, N and ShareIndex are that split; all omitted
+	// when there was none (a runner without a setup). OrderSHA256 is of the
+	// signed order they were sealed under, omitted when there was none:
+	// with a split and no order the file waits for the order the approvers
+	// sign for that split, which import -sealed attaches (checkSealed).
 	OrderSHA256 string `json:"order_sha256,omitempty"`
 	SplitSHA256 string `json:"split_sha256,omitempty"`
 	T           uint8  `json:"t,omitempty"`
 	N           uint8  `json:"n,omitempty"`
 	ShareIndex  uint8  `json:"share_index,omitempty"`
-	// Frames are EncodeImportBatch bodies, each with the order and at most
-	// wireadmin.MaxBatch shares, one frame's worth of bytes each.
+	// Frames are EncodeImportBatch bodies with at most wireadmin.MaxBatch
+	// shares, one frame's worth of bytes each, under the order when there
+	// was one. A share's split goes in its frame under an order; without
+	// one the relay adds it from the order and the split file.
 	Frames [][]byte `json:"frames"`
 }
 
@@ -87,19 +93,27 @@ func readSealedFile(path string) (*sealedFile, error) {
 // checked with the settings and key set it carries, the shares are checked
 // against the split and the order exactly as import checks them before it
 // dials, and each share is sealed with the runner's public import key.
+//
+// The order is optional. Sealed with -order, the file holds frames the
+// relay sends as they are. Sealed with -split alone, the shares are checked
+// against the split (the signer's share index is the split's) and the file
+// waits for the order the approvers sign for that split: the dealer is
+// visited once, split and seal together, and import -sealed attaches the
+// order (checkSealed). The sealed bytes bind the share's header, not the
+// order, and the runner checks the order it is sent.
 func cmdSeal(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("seal", flag.ContinueOnError)
 	identPath := fs.String("identity", "", "the identity file of signer-admin identity (required)")
 	sharesPath := fs.String("shares", "", "the shares file: one share per line, mode 0600")
-	orderPath := fs.String("order", "", "the signed import order (import.signed); a runner with a setup takes no share without one")
-	splitPath := fs.String("split", "", "with -order: the split file of import-draft, for each validator's commitments")
+	orderPath := fs.String("order", "", "the signed import order (import.signed); without it the shares are sealed for the signer's share index of -split and import -sealed attaches the order")
+	splitPath := fs.String("split", "", "the split file of import-draft, for each validator's commitments")
 	icPath := fs.String("interchange", "", "EIP-3076 slashing protection file (format 5), sealed in with each share")
 	outPath := fs.String("out", "sealed.json", "the sealed file to write (ciphertext)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 || *identPath == "" || *sharesPath == "" || (*orderPath == "") != (*splitPath == "") {
-		return errors.New("usage: signer-admin seal -identity FILE -shares FILE [-order import.signed -split split.json] " +
+	if fs.NArg() != 0 || *identPath == "" || *sharesPath == "" || (*orderPath != "" && *splitPath == "") {
+		return errors.New("usage: signer-admin seal -identity FILE -shares FILE [-order import.signed] [-split split.json] " +
 			"[-interchange FILE] -out FILE")
 	}
 	// The shares file is plaintext: no core dumps from here on.
@@ -123,7 +137,15 @@ func cmdSeal(args []string, out io.Writer) error {
 		raw   []byte
 		o     *importorder.Order
 		split *splitFile
+		// index is the share index the shares must have: the order's under
+		// an order, else the signer's in the split.
+		index uint8
 	)
+	if *splitPath != "" {
+		if split, err = readSplit(*splitPath); err != nil {
+			return err
+		}
+	}
 	if *orderPath != "" {
 		if raw, err = os.ReadFile(*orderPath); err != nil {
 			return err
@@ -131,9 +153,7 @@ func cmdSeal(args []string, out io.Writer) error {
 		if o, err = importorder.Decode(raw); err != nil {
 			return fmt.Errorf("%s: %w", *orderPath, err)
 		}
-		if split, err = readSplit(*splitPath); err != nil {
-			return err
-		}
+		index = o.Body.ShareIndex
 		if split.T != o.Body.T || split.N != o.Body.N {
 			return fmt.Errorf("%s is a %d of %d split, the order names %d of %d", *splitPath, split.T, split.N, o.Body.T, o.Body.N)
 		}
@@ -156,6 +176,14 @@ func cmdSeal(args []string, out io.Writer) error {
 					*orderPath, hex8(o.Body.ClusterID), f.Signer, hex8(clID))
 			}
 		}
+	} else if split != nil {
+		// No order, a split: the signer's share index is the split's, so
+		// the order the approvers sign for this split fits these shares.
+		var ok bool
+		if index, ok = split.Shares[f.Signer]; !ok || index == 0 || index > split.N {
+			return fmt.Errorf("%s is a %d of %d split with no share for %s, the identity is %s's; without -order the seal takes the share index from it",
+				*splitPath, split.T, split.N, f.Signer, f.Signer)
+		}
 	}
 	shares, err := readShares(*sharesPath)
 	if err != nil {
@@ -166,8 +194,8 @@ func cmdSeal(args []string, out io.Writer) error {
 			clear(shares[i].secret[:])
 		}
 	}()
-	if o != nil {
-		if err := checkShareIndex(*sharesPath, shares, split, o); err != nil {
+	if split != nil {
+		if err := checkShareIndex(*sharesPath, shares, split, index); err != nil {
 			return err
 		}
 	}
@@ -194,9 +222,10 @@ func cmdSeal(args []string, out io.Writer) error {
 	// The shares to seal, each with its secret, as the online import
 	// builds them for SealBatches.
 	var (
-		reqs    []cloud.SealedImportRequest
-		secrets [][32]byte
-		failed  bool
+		reqs       []cloud.SealedImportRequest
+		secrets    [][32]byte
+		failed     bool
+		otherSplit bool // a share the order does not take: an order of another split
 	)
 	defer clear(secrets)
 	for i := range shares {
@@ -208,14 +237,27 @@ func cmdSeal(args []string, out io.Writer) error {
 			continue
 		}
 		r := cloud.SealedImportRequest{Pubkey: s.pubkey, SharePubkey: sp, Index: s.index}
-		if o != nil {
+		if split != nil {
 			comm, ok := split.commitmentsOf(s.pubkey)
 			if !ok {
 				failed = true
 				fprintf(out, "%s %s: not in the split file, not sealed\n", f.Signer, s.pubkey)
 				continue
 			}
-			r.T, r.N, r.ShareIndex, r.Commitments = o.Body.T, o.Body.N, o.Body.ShareIndex, comm
+			if o != nil {
+				// The order must take the share, as the runner checks
+				// (checkOrderShare), and its split goes with the share in
+				// the frame. Without an order there is nothing to check yet
+				// and the frame carries no split (the wire format needs the
+				// order for it): import -sealed checks the order it
+				// attaches and adds the split from it and the split file.
+				r.T, r.N, r.ShareIndex, r.Commitments = o.Body.T, o.Body.N, o.Body.ShareIndex, comm
+				if err := checkOrderShare(&o.Body, &r); err != nil {
+					failed, otherSplit = true, true
+					fprintf(out, "%s %s: %v, not sealed\n", f.Signer, s.pubkey, err)
+					continue
+				}
+			}
 		}
 		if ic != nil {
 			if r.Interchange, err = ic.markOf(s.pubkey); err != nil {
@@ -233,6 +275,9 @@ func cmdSeal(args []string, out io.Writer) error {
 		reqs, secrets = append(reqs, r), append(secrets, s.secret)
 	}
 	if failed {
+		if otherSplit {
+			fprintf(out, "%s does not go with %s: %s\n", *orderPath, *splitPath, orderOtherSplit)
+		}
 		return errReported
 	}
 	if len(reqs) == 0 {
@@ -254,14 +299,16 @@ func cmdSeal(args []string, out io.Writer) error {
 		sf.Identity.TLSKeySHA256 = ""
 	}
 	sf.Identity.SetupSHA256 = fullHex(id.State.SetupHash)
-	if o != nil {
-		sf.OrderSHA256 = fullHex(sha256.Sum256(raw))
+	if split != nil {
 		if splitRaw, err := os.ReadFile(*splitPath); err != nil {
 			return err
 		} else {
 			sf.SplitSHA256 = fullHex(sha256.Sum256(splitRaw))
 		}
-		sf.T, sf.N, sf.ShareIndex = o.Body.T, o.Body.N, o.Body.ShareIndex
+		sf.T, sf.N, sf.ShareIndex = split.T, split.N, index
+	}
+	if o != nil {
+		sf.OrderSHA256 = fullHex(sha256.Sum256(raw))
 	}
 	for _, b := range batches {
 		p, err := wireadmin.EncodeImportBatch(raw, b)
@@ -289,6 +336,9 @@ func cmdSeal(args []string, out io.Writer) error {
 	fprintf(out, "sealed %d shares of %s (verifier %s) to import key %s", len(reqs), f.Signer, f.Attestation.Verifier, hex8(sha256.Sum256(id.ImportKey)))
 	if o != nil {
 		fprintf(out, ", %d of %d, share index %d, order %s", o.Body.T, o.Body.N, o.Body.ShareIndex, hex8(sha256.Sum256(raw)))
+	} else if split != nil {
+		fprintf(out, ", %d of %d, share index %d, no import order yet: on the online machine draft and sign the orders from the split file, and relay with -order and -commitments",
+			split.T, split.N, index)
 	}
 	fprintf(out, "; wrote %s — the file is ciphertext, valid until the runner restarts; carry only it to the online machine\n", *outPath)
 	return nil
@@ -337,54 +387,71 @@ func trim0x(s string) string {
 
 // checkSealed checks a sealed file before anything is sent: the signer it
 // names, the fingerprints of the order and the split when the relay names
-// them, and the frames, which must decode and match the split. It returns
-// the decoded frames, one slice per frame.
-func checkSealed(sf *sealedFile, name string, raw []byte, o *importorder.Order, split *splitFile, commPath string) ([][]cloud.SealedImportRequest, error) {
+// them, the frames, which must decode and match the split, and that the
+// order takes every share. It returns the decoded frames, one slice per
+// frame, ready to send, and a notice when the relay's order is not the one
+// the file was sealed under.
+//
+// The sealed bytes bind the share's header only (package sealedimport),
+// not the order or the split fields: the runner checks those against the
+// order it is sent. So a file sealed with a split and no order waits for
+// the order the approvers sign for that split, and the relay attaches it
+// with the split; and a file sealed under one order goes under another
+// that takes its shares the same way. What the runner would refuse for is
+// refused here, with nothing sent.
+func checkSealed(sf *sealedFile, name string, raw []byte, o *importorder.Order, split *splitFile, commPath string) ([][]cloud.SealedImportRequest, string, error) {
 	if sf.Version != 1 {
-		return nil, fmt.Errorf("version %d, want 1", sf.Version)
+		return nil, "", fmt.Errorf("version %d, want 1", sf.Version)
 	}
 	if sf.Signer != name {
-		return nil, fmt.Errorf("sealed for signer %q, this is %q", sf.Signer, name)
+		return nil, "", fmt.Errorf("sealed for signer %q, this is %q", sf.Signer, name)
 	}
 	if b, err := hex.DecodeString(sf.Identity.ImportKeySHA256); err != nil || len(b) != 32 {
-		return nil, errors.New("identity.import_key_sha256 is not 64 hex digits")
+		return nil, "", errors.New("identity.import_key_sha256 is not 64 hex digits")
 	}
 	if len(sf.Frames) == 0 {
-		return nil, errors.New("no frames")
+		return nil, "", errors.New("no frames")
 	}
+	// waiting: sealed with a split and no order, for the order the relay
+	// attaches.
+	waiting := sf.SplitSHA256 != "" && sf.OrderSHA256 == ""
+	if waiting && (o == nil || split == nil || commPath == "") {
+		return nil, "", errors.New("sealed without an import order: relay it with -order, the order the approvers signed for its split, and -commitments, that split file")
+	}
+	var notice string
 	if o != nil {
-		if sf.OrderSHA256 == "" {
-			return nil, errors.New("sealed without an order, but the relay names one")
+		if sf.OrderSHA256 == "" && !waiting {
+			return nil, "", errors.New("sealed without an order, but the relay names one")
 		}
-		if sf.OrderSHA256 != fullHex(sha256.Sum256(raw)) {
-			return nil, fmt.Errorf("sealed for order %s, the relay's order is %s", sf.OrderSHA256, fullHex(sha256.Sum256(raw)))
+		if sf.OrderSHA256 != "" && sf.OrderSHA256 != fullHex(sha256.Sum256(raw)) {
+			notice = fmt.Sprintf("sealed for order %s, relayed under order %s", sf.OrderSHA256, fullHex(sha256.Sum256(raw)))
 		}
 		if sf.T != o.Body.T || sf.N != o.Body.N || sf.ShareIndex != o.Body.ShareIndex {
-			return nil, fmt.Errorf("sealed for a %d of %d split of share index %d, the order names %d of %d, share index %d",
+			return nil, "", fmt.Errorf("sealed for a %d of %d split of share index %d, the order names %d of %d, share index %d",
 				sf.T, sf.N, sf.ShareIndex, o.Body.T, o.Body.N, o.Body.ShareIndex)
 		}
 		if sf.Identity.SetupSHA256 != "" && sf.Identity.SetupSHA256 != fullHex(o.Body.Target) {
-			return nil, fmt.Errorf("sealed for setup %s, the order names setup %s", sf.Identity.SetupSHA256, fullHex(o.Body.Target))
+			return nil, "", fmt.Errorf("sealed for setup %s, the order names setup %s", sf.Identity.SetupSHA256, fullHex(o.Body.Target))
 		}
 	}
 	var frames [][]cloud.SealedImportRequest
 	for i, p := range sf.Frames {
 		reqs, err := wireadmin.DecodeImportBatch(p)
 		if err != nil {
-			return nil, fmt.Errorf("frame %d: %w", i+1, err)
+			return nil, "", fmt.Errorf("frame %d: %w", i+1, err)
 		}
 		if len(reqs) == 0 {
-			return nil, fmt.Errorf("frame %d holds no share", i+1)
+			return nil, "", fmt.Errorf("frame %d holds no share", i+1)
 		}
 		frames = append(frames, reqs)
 	}
 	if split != nil && commPath != "" && sf.SplitSHA256 != "" {
 		b, err := os.ReadFile(commPath)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if sf.SplitSHA256 != fullHex(sha256.Sum256(b)) {
-			return nil, fmt.Errorf("sealed for split %s, %s is %s", sf.SplitSHA256, commPath, fullHex(sha256.Sum256(b)))
+			return nil, "", fmt.Errorf("sealed for split %s, %s is %s", sf.SplitSHA256, commPath, fullHex(sha256.Sum256(b)))
 		}
 		for fi, reqs := range frames {
 			for ri, r := range reqs {
@@ -393,22 +460,75 @@ func checkSealed(sf *sealedFile, name string, raw []byte, o *importorder.Order, 
 				}
 				comm, ok := split.commitmentsOf(r.Pubkey)
 				if !ok {
-					return nil, fmt.Errorf("frame %d share %d: %s is not in the split file", fi+1, ri+1, r.Pubkey)
+					return nil, "", fmt.Errorf("frame %d share %d: %s is not in the split file", fi+1, ri+1, r.Pubkey)
 				}
 				if !slices.Equal(r.Commitments, comm) {
-					return nil, fmt.Errorf("frame %d share %d: commitments of %s differ from the split file", fi+1, ri+1, r.Pubkey)
+					return nil, "", fmt.Errorf("frame %d share %d: commitments of %s differ from the split file", fi+1, ri+1, r.Pubkey)
 				}
 				if r.N != split.N {
-					return nil, fmt.Errorf("frame %d share %d: n %d, the split file says %d", fi+1, ri+1, r.N, split.N)
+					return nil, "", fmt.Errorf("frame %d share %d: n %d, the split file says %d", fi+1, ri+1, r.N, split.N)
 				}
 			}
 		}
 	}
-	return frames, nil
+	// The order takes every share, as the runner checks before it opens
+	// one: the share is of the order's split (t, n, share index), the order
+	// names its validator with the hash of its commitments
+	// (checkOrderShare), and the share is the commitments' point at the
+	// share index. The order is the relay's; a file sealed under one and
+	// relayed without -order carries it in its frames.
+	for fi, reqs := range frames {
+		var body *importorder.Body
+		if o != nil {
+			body = &o.Body
+		} else if len(reqs[0].Order) > 0 {
+			embedded, err := importorder.Decode(reqs[0].Order)
+			if err != nil {
+				return nil, "", fmt.Errorf("frame %d: the import order it carries: %v", fi+1, err)
+			}
+			body = &embedded.Body
+		}
+		if body == nil {
+			continue
+		}
+		for ri := range reqs {
+			r := &reqs[ri]
+			if r.T == 0 && !waiting {
+				continue
+			}
+			full := *r
+			if waiting {
+				// The split comes from the split file the relay names, which
+				// is the one the shares were sealed for (SplitSHA256); the
+				// order from the relay.
+				comm, ok := split.commitmentsOf(r.Pubkey)
+				if !ok {
+					return nil, "", fmt.Errorf("frame %d share %d: %s is not in the split file", fi+1, ri+1, r.Pubkey)
+				}
+				full.Order, full.T, full.N, full.ShareIndex, full.Commitments = raw, o.Body.T, o.Body.N, o.Body.ShareIndex, comm
+			} else if o != nil {
+				full.Order = raw // the relay's order, when it is not the one sealed under
+			}
+			if full.T != body.T || full.N != body.N || full.ShareIndex != body.ShareIndex {
+				return nil, "", fmt.Errorf("frame %d share %d: a share of a %d of %d split of share index %d, the order names %d of %d, share index %d; nothing sent",
+					fi+1, ri+1, full.T, full.N, full.ShareIndex, body.T, body.N, body.ShareIndex)
+			}
+			if err := checkOrderShare(body, &full); err != nil {
+				return nil, "", fmt.Errorf("frame %d share %d: %v; nothing sent. %s", fi+1, ri+1, err, orderOtherSplit)
+			}
+			if want, err := threshold.FeldmanEval(full.Commitments, uint64(full.ShareIndex)); err != nil || want != full.SharePubkey {
+				return nil, "", fmt.Errorf("frame %d share %d: share_pubkey %s is not share %d of validator %s; nothing sent",
+					fi+1, ri+1, full.SharePubkey, full.ShareIndex, full.Pubkey)
+			}
+			reqs[ri] = full
+		}
+	}
+	return frames, notice, nil
 }
 
 // relaySealed sends the frames of an offline seal to the runner as they
-// are: nothing on this machine reads a share. The live runner's import key
+// came out of checkSealed, each share under the order the relay names:
+// nothing on this machine reads a share. The live runner's import key
 // is checked against the one the file was sealed to first — a runner that
 // restarted since the seal cannot open the file, and sealing again on the
 // dealer is cheap. held names the validators the runner holds already

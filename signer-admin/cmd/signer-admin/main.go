@@ -88,25 +88,30 @@
 //	    none, or, to a runner that does not know that message, one
 //	    IMPORT_SHARE_SEALED per share. A prod-chain runner takes no
 //	    plaintext shares file (see -sealed).
-//	signer-admin import -cluster cluster.json -signer NAME [-order import.signed] -sealed FILE
+//	signer-admin import -cluster cluster.json -signer NAME [-order import.signed -commitments FILE] -sealed FILE
 //	    Relay the file of signer-admin seal as it is: no plaintext comes
 //	    near this machine. The live runner's import key is checked against
 //	    the one the file was sealed to first, so a restarted runner is
 //	    refused before anything is sent; seal again on the dealer then.
-//	    -order and -commitments are optional cross-checks of the file.
+//	    The order must take every share of the file, which is checked
+//	    before anything is sent: -order and -commitments name it for a
+//	    file sealed without one, and cross-check a file sealed with one.
 //	signer-admin identity -cluster cluster.json -signer NAME -out FILE
 //	signer-admin identity -conn cloud.json [-setup FILE] -out FILE
 //	    Fetch the runner's IDENTITY with a fresh nonce, check it with the
 //	    signer's verifier settings, and write it with those settings and
 //	    the issuer key set to a public file, for the offline seal. The
 //	    file is good until the runner restarts.
-//	signer-admin seal -identity FILE -shares FILE [-order import.signed -split FILE] [-interchange FILE] -out FILE
+//	signer-admin seal -identity FILE -shares FILE [-order import.signed] [-split FILE] [-interchange FILE] -out FILE
 //	    Offline, on the dealer: check the identity file's attestation
 //	    document with the settings and key set it carries (no network),
 //	    check the shares against the order and split as import does, and
 //	    seal each share to the runner's attested import key. The output
 //	    file is ciphertext, ready for import -sealed on the online
-//	    machine; the plaintext shares never leave the dealer.
+//	    machine; the plaintext shares never leave the dealer. Without
+//	    -order, -split gives the signer's share index and the file waits
+//	    for the order the approvers sign for that split, which import
+//	    -sealed attaches: one visit to the dealer.
 //	signer-admin exit -cluster cluster.json [-signers NAME,...] [-split FILE] -pubkey 0x... -index N -epoch E -out exit.json|-partial-out FILE
 //	    Sign a voluntary exit: send SIGN of the exit to the signers in turn
 //	    until t partial signatures verify under their share keys (t and the
@@ -219,10 +224,10 @@ const usage = `usage:
   signer-admin probe -cluster cluster.json [-signers NAME,...]
   signer-admin import-draft -cluster cluster.json -signer NAME -split FILE [-not-after 12h] [-allow-gcp-unsafe-single-key] [-out import.bin]
   signer-admin import -cluster cluster.json -signer NAME -order import.signed -shares FILE -commitments FILE
-  signer-admin import -cluster cluster.json -signer NAME [-order import.signed] -sealed FILE
+  signer-admin import -cluster cluster.json -signer NAME [-order import.signed -commitments FILE] -sealed FILE
   signer-admin identity -cluster cluster.json -signer NAME -out FILE
   signer-admin identity -conn cloud.json [-setup FILE] -out FILE
-  signer-admin seal -identity FILE -shares FILE [-order import.signed -split FILE] [-interchange FILE] -out FILE
+  signer-admin seal -identity FILE -shares FILE [-order import.signed] [-split FILE] [-interchange FILE] -out FILE
   signer-admin exit -cluster cluster.json [-signers NAME,...] [-split FILE] -pubkey 0x... -index N -epoch E -out exit.json|-partial-out FILE
   signer-admin exit-combine -split FILE [-pubkey 0x...] [-index N] [-epoch E] -out exit.json PARTIALS...
   signer-admin split -keystores DIR -password-file FILE -t T -n N -signers NAME,... [-chain mainnet|hoodi|devnet|ci-test] [-expect FILE] [-allow-swap] -out DIR

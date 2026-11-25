@@ -181,16 +181,21 @@ func splitDevRunners(t *testing.T, signerNames []string, tt int, signing []strin
 		signed := filepath.Join(dir, n, "import.signed")
 		mustTool(t, append([]string{"assemble", "-out", signed, body}, sigs...)...)
 		var out string
-		if i == 0 {
+		if i < 2 {
 			// The offline seal: the identity comes off this runner, the
 			// shares are sealed to it without a network, and the import
-			// relays the sealed file. The first signer goes this way, the
-			// rest the plaintext way.
+			// relays the sealed file. The first signer seals without an
+			// order, which the relay attaches; the second seals under its
+			// order. The rest go the plaintext way.
 			ident := filepath.Join(dir, n, n+".identity.json")
 			mustTool(t, "identity", "-cluster", cl, "-signer", n, "-out", ident)
 			sealed := filepath.Join(dir, n, n+".sealed.json")
-			mustTool(t, "seal", "-identity", ident, "-shares", filepath.Join(e.out, "shares", n, "shares.txt"),
-				"-order", signed, "-split", splitPath, "-out", sealed)
+			sealArgs := []string{"seal", "-identity", ident, "-shares", filepath.Join(e.out, "shares", n, "shares.txt"),
+				"-split", splitPath, "-out", sealed}
+			if i == 1 {
+				sealArgs = append(sealArgs, "-order", signed)
+			}
+			mustTool(t, sealArgs...)
 			out = mustTool(t, "import", "-cluster", cl, "-signer", n, "-order", signed,
 				"-commitments", splitPath, "-sealed", sealed)
 		} else {

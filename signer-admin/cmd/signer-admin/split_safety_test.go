@@ -27,7 +27,7 @@ func TestImportWrongSharesFileRefused(t *testing.T) {
 
 	wrong := filepath.Join(e.out, "shares", "s1", "shares.txt")
 	out := failTool(t, "import", "-cluster", fc.cluster, "-signer", "s2", "-order", signed, "-shares", wrong, "-commitments", splitPath)
-	wantIn(t, out, wrong+":1 is share 1 of validator "+e.pks[0].String(), "the order is for share index 2", "nothing sent")
+	wantIn(t, out, wrong+":1 is share 1 of validator "+e.pks[0].String(), "want share index 2", "nothing sent")
 	r := fc.runners["s2"]
 	for _, typ := range []wire.MsgType{wireadmin.TypeImportShare, wireadmin.TypeImportSealed, wireadmin.TypeImportBatch} {
 		if n := r.Seen(typ); n != 0 {
